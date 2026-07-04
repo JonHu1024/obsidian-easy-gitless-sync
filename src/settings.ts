@@ -1,4 +1,4 @@
-import { App, PluginSettingTab, Setting } from "obsidian";
+import { App, PluginSettingTab, Setting, TextComponent } from "obsidian";
 import type GitHubSyncPlugin from "./main";
 
 export interface GitHubSyncSettings {
@@ -38,16 +38,36 @@ export class GitHubSyncSettingTab extends PluginSettingTab {
         containerEl.empty();
         containerEl.addClass('github-sync-settings');
 
+        let textComponent: TextComponent;
         new Setting(containerEl)
             .setName('GitHub Token')
-            .setDesc('你的 GitHub Personal Access Token')
-            .addText(text => text
-                .setPlaceholder('ghp_xxxx')
-                .setValue(this.plugin.settings.token)
-                .onChange(async (value) => {
-                    this.plugin.settings.token = value;
-                    await this.plugin.saveSettings();
-                }));
+            .setDesc('你的 GitHub Personal Access Token（保存时自动加密存储）')
+            .addText(text => {
+                textComponent = text;
+                text
+                    .setPlaceholder('ghp_xxxx')
+                    .setValue(this.plugin.settings.token)
+                    .onChange(async (value) => {
+                        this.plugin.settings.token = value;
+                        await this.plugin.saveSettings();
+                    });
+                text.inputEl.type = 'password';
+                text.inputEl.addClass('github-sync-token-input');
+            })
+            .addButton(btn => {
+                btn.setIcon('eye')
+                    .setTooltip('显示/隐藏 Token')
+                    .onClick(() => {
+                        const input = textComponent.inputEl;
+                        if (input.type === 'password') {
+                            input.type = 'text';
+                            btn.setIcon('eye-off');
+                        } else {
+                            input.type = 'password';
+                            btn.setIcon('eye');
+                        }
+                    });
+            });
 
         new Setting(containerEl)
             .setName('仓库')

@@ -2,11 +2,13 @@
 
 import { Notice, Plugin, TFile, normalizePath } from "obsidian";
 import { GitHubClient, GitHubFile } from "./github";
-import { computeDiff, DiffResult, FileDiff } from "./diff";
+import { computeDiff, DiffResult, FileDiff, isTextFile, mergeTexts } from "./diff";
 import {
 	ConfirmSyncModal,
+	DiffViewerModal,
 	ProgressModal,
 	SyncMode,
+	RollbackModal,
 	SyncModeModal,
 	UnsyncedWarningModal,
 } from "./modals";
@@ -15,6 +17,9 @@ import {
 	GitHubSyncSettings,
 	GitHubSyncSettingTab,
 } from "./settings";
+import { CSS } from "./styles";
+import { pMap, strToArrayBuffer, getErrorMessage } from "./utils";
+import { RollbackManager } from "./rollback";
 
 interface LocalFileSnapshot {
 	files: Map<string, ArrayBuffer>;
@@ -24,6 +29,8 @@ interface LocalFileSnapshot {
 interface SmartSyncPlan {
 	uploads: FileDiff[];
 	downloads: FileDiff[];
+	deletions: FileDiff[];
+	merges: FileDiff[];
 	previewItems: FileDiff[];
 	unchanged: number;
 }
@@ -31,15 +38,27 @@ interface SmartSyncPlan {
 export default class GitHubSyncPlugin extends Plugin {
 	settings!: GitHubSyncSettings;
 	private isSyncing = false;
+	private isPreparing = false;
 	private isDirty = false; // 最终是否有未同步的修改
 	private statusBarEl!: HTMLElement; // 状态栏元素
 	// 新增：用于记录未同步文件和防抖保存
 	private unsyncedPaths = new Set<string>();
 	private saveStateTimer: number | null = null;
 	private recentlySyncedPaths = new Set<string>();// 冷却池：防止同步写入触发的 modify 被误判
+	private rollbackManager: RollbackManager;
 
 	async onload() {
 		await this.loadSettings();
+
+		this.rollbackManager = new RollbackManager(this.app);
+
+		// 首次运行：默认提交信息自动填入设备名
+		if (this.settings.commitMessage === DEFAULT_SETTINGS.commitMessage) {
+			let hostname = "Device";
+			try { hostname = require("os").hostname() || "Device"; } catch {}
+			this.settings.commitMessage = `${hostname} sync {date}`;
+			await this.saveSettings();
+		}
 
 		// 正常用户不可能一次退出前手动改了 10 个以上的文件还没同步。如果超过 10 个，绝对是之前启动风暴导致的脏数据，直接清空！
 		if (this.settings.lastUnsyncedPaths && this.settings.lastUnsyncedPaths.length > 10) {
@@ -48,10 +67,12 @@ export default class GitHubSyncPlugin extends Plugin {
 			await this.saveSettings();
 		}
 
-		// 恢复内存中的未同步集合
+		// 恢复内存中的未同步集合（过滤已配置的忽略路径）
 		if (this.settings.hasUnsyncedChanges) {
 			this.isDirty = true;
-			this.settings.lastUnsyncedPaths.forEach(p => this.unsyncedPaths.add(p));
+			this.settings.lastUnsyncedPaths
+				.filter(p => !this.shouldIgnoreBySettings(p))
+				.forEach(p => this.unsyncedPaths.add(p));
 		}
 
 		//初始化状态栏
@@ -83,9 +104,15 @@ export default class GitHubSyncPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: "quick-smart",
-			name: "快速智能同步(按修改时间自动决定方向)",
-			callback: () => this.startSync("smart"),
+			id: "quick-time",
+			name: "按时间同步(按修改时间自动决定方向)",
+			callback: () => this.startSync("time"),
+		});
+
+		this.addCommand({
+			id: "quick-merge",
+			name: "智能合并(自动合并冲突文件)",
+			callback: () => this.startSync("merge"),
 		});
 
 		// 设置选项卡
@@ -105,9 +132,10 @@ export default class GitHubSyncPlugin extends Plugin {
 				if (this.isSyncing) return;
 				if (!(file instanceof TFile)) return;
 				
-				// 硬编码无视 .obsidian 目录
-				// 用户的笔记修改才需要提醒，配置文件的变动不应污染“未同步名单”
+				// 先硬编码无视 .obsidian 目录
 				if (file.path.startsWith('.obsidian/') || file.path === '.obsidian') return;
+				// 再检查用户配置的忽略路径
+				if (this.shouldIgnoreBySettings(file.path)) return;
 				
 				if (this.recentlySyncedPaths.has(file.path)) return;
 
@@ -127,21 +155,15 @@ export default class GitHubSyncPlugin extends Plugin {
 						menu.addSeparator();
 						menu.addItem((item) => {
 							item
-								.setTitle("Push To GitHub")
-								.setIcon("arrow-up-circle")
-								.onClick(() => this.startSync("push", file.path));
-						});
-						menu.addItem((item) => {
-							item
-								.setTitle("Pull From GitHub")
-								.setIcon("arrow-down-circle")
-								.onClick(() => this.startSync("pull", file.path));
-						});
-						menu.addItem((item) => {
-							item
-								.setTitle("Smart Push/Pull")
-								.setIcon("refresh-cw")
-								.onClick(() => this.startSync("smart", file.path));
+								.setTitle("GitHub Sync")
+								.setIcon("github")
+								.onClick(() => {
+new SyncModeModal(
+	this.app,
+	(mode) => this.startSync(mode, file.path),
+	() => this.openRollback()
+).open();
+								});
 						});
 					}
 				})
@@ -154,13 +176,16 @@ export default class GitHubSyncPlugin extends Plugin {
 				new UnsyncedWarningModal(
 					this.app,
 					this.settings.lastUnsyncedPaths || [],
-					() => this.openSyncModal()
+					() => this.openSyncModal(),
+					this
 				).open();
 			}, 800);//延迟0.8s防止与启动动画冲突
 		}
 	}
 
 	onunload() {
+		if (this.saveStateTimer) window.clearTimeout(this.saveStateTimer);
+		this.recentlySyncedPaths.clear();
 		const style = document.getElementById("github-sync-styles");
 		if (style) style.remove();
 	}
@@ -171,19 +196,39 @@ export default class GitHubSyncPlugin extends Plugin {
 		this.saveStateTimer = window.setTimeout(async () => {
 			this.settings.hasUnsyncedChanges = this.isDirty;
 			this.settings.lastUnsyncedPaths = Array.from(this.unsyncedPaths);
-			await this.saveSettings();
+			await this.saveSettings().catch(err => console.error("防抖保存状态失败:", err));
 		}, 5*1000);
 	}
 
 	// 新增：彻底清理未同步状态（同步成功后调用）
 	private async clearDirtyState() {
+		try {
+			await this.saveSettings();
+		} catch (err) {
+			console.error("清除脏状态时保存设置失败:", err);
+			return;
+		}
 		this.isDirty = false;
 		this.unsyncedPaths.clear();
 		this.settings.hasUnsyncedChanges = false;
 		this.settings.lastUnsyncedPaths = [];
 		if (this.saveStateTimer) window.clearTimeout(this.saveStateTimer);
-		await this.saveSettings(); // 立即保存
 		this.updateStatusBar();
+	}
+
+	// 对比发现内容一致的路径，从未同步列表中移除
+	onCompareIdentical(paths: string[]) {
+		let changed = false;
+		for (const p of paths) {
+			if (this.unsyncedPaths.delete(p)) changed = true;
+		}
+		if (!changed) return;
+
+		if (this.unsyncedPaths.size === 0) {
+			this.clearDirtyState();
+		} else {
+			this.debounceSaveState();
+		}
 	}
 
 	// 修改原有的 setDirty，使其与持久化状态同步
@@ -202,8 +247,21 @@ export default class GitHubSyncPlugin extends Plugin {
 			this.statusBarEl.setText("⚠️GitHub未同步");
 			this.statusBarEl.style.color = "var(--text-warning, #e6922a)";
 			this.statusBarEl.style.cursor = "pointer";
-			this.statusBarEl.title = "点击立即同步";
-			this.statusBarEl.onclick = () => this.openSyncModal();
+			this.statusBarEl.title = "点击对比未同步文件";
+			this.statusBarEl.onclick = () => {
+				if (this.unsyncedPaths.size > 0) {
+					new DiffViewerModal(
+						this.app,
+						Array.from(this.unsyncedPaths),
+						this,
+						() => this.openSyncModal(),
+						true,
+						(paths) => this.onCompareIdentical(paths)
+					).open();
+				} else {
+					this.openSyncModal();
+				}
+			};
 		} else {
 			this.statusBarEl.setText("✅GitHub已同步");
 			this.statusBarEl.style.color = "var(--text-success, #28a745)";
@@ -219,10 +277,44 @@ export default class GitHubSyncPlugin extends Plugin {
 			DEFAULT_SETTINGS,
 			await this.loadData()
 		);
+		// 解密 token（base64 → 原文）
+		if (this.settings.token) {
+			try { this.settings.token = atob(this.settings.token); } catch {}
+		}
 	}
 
 	async saveSettings() {
-		await this.saveData(this.settings);
+		const data = { ...this.settings };
+		// 加密存储 token（原文 → base64）
+		if (data.token) data.token = btoa(data.token);
+		await this.saveData(data);
+	}
+
+	// ──────────────────────────────────────────────
+	// 回滚快照
+	// ──────────────────────────────────────────────
+
+	/** 收集受影响的文件当前内容，供同步前快照使用 */
+	private async collectPreSyncFiles(
+		paths: string[]
+	): Promise<Map<string, ArrayBuffer>> {
+		const result = new Map<string, ArrayBuffer>();
+		await pMap(
+			paths,
+			async (path) => {
+				try {
+					const file = this.app.vault.getAbstractFileByPath(
+						normalizePath(path)
+					);
+					if (file instanceof TFile) {
+						const content = await this.app.vault.readBinary(file);
+						result.set(path, content);
+					}
+				} catch {}
+			},
+			8
+		);
+		return result;
 	}
 
 	// ──────────────────────────────────────────────
@@ -231,17 +323,22 @@ export default class GitHubSyncPlugin extends Plugin {
 
 	private openSyncModal() {
 		if (!this.checkConfig()) return;
-		new SyncModeModal(this.app, (mode) => this.startSync(mode)).open();
+		new SyncModeModal(
+			this.app,
+			(mode) => this.startSync(mode),
+			() => this.openRollback()
+		).open();
 	}
 
 	async startSync(mode: SyncMode, targetPath?: string) {
 		if (!this.checkConfig()) return;
 
-		if (this.isSyncing) {
+		if (this.isSyncing || this.isPreparing) {
 			new Notice("正在同步...(点击屏幕空白区域可以后台运行同步)");
 			return;
 		}
 
+		this.isPreparing = true;
 		const progress = new ProgressModal(this.app);
 		progress.open();
 
@@ -266,13 +363,6 @@ export default class GitHubSyncPlugin extends Plugin {
 			progress.setMessage("计算差异...");
 			let diff = await computeDiff(local.files, remote.files, ignore);
 
-			// 新增：如果没有差异，说明已经是最新，重置 Dirty 状态
-			const hasChanges =
-				diff.toUpload.length > 0 ||
-				diff.toDelete.length > 0 ||
-				diff.toDownload.length > 0 ||
-				diff.toRemove.length > 0;
-
 			if (targetPath) {
 				diff = {
 					toUpload: diff.toUpload.filter((f) => f.path === targetPath),
@@ -283,20 +373,26 @@ export default class GitHubSyncPlugin extends Plugin {
 				};
 			}
 
-			if (!hasChanges && !targetPath) {
-				this.setDirty(false);
-			}
-
-			// 4. 生成智能同步计划(如需要)
+			// 4. 生成同步计划(如需要)
 			let smartPlan: SmartSyncPlan | null = null;
-			if (mode === "smart") {
-				progress.setMessage("分析修改时间并生成智能同步计划...");
-				smartPlan = await this.buildSmartSyncPlan(client, local, remote.files, diff);
+			if (mode === "time") {
+				progress.setMessage("分析修改时间并生成同步计划...");
+				smartPlan = await this.buildTimeSyncPlan(client, local, remote.files, diff);
+			} else if (mode === "merge") {
+				progress.setMessage("分析冲突并生成合并计划...");
+				smartPlan = await this.buildMergePlan(client, local, remote.files, diff);
 			}
 
 			progress.close();
 
 			// 5. 弹出确认框
+			const onCompare = (path: string) => {
+				new DiffViewerModal(
+					this.app, [path], this, () => {}, false,
+					(p) => this.onCompareIdentical(p)
+				).open();
+			};
+
 			if (mode === "push") {
 				const toProcess = diff.toUpload;
 				const toRemove = diff.toDelete;
@@ -305,6 +401,7 @@ export default class GitHubSyncPlugin extends Plugin {
 					toProcess,
 					toRemove,
 					unchanged: diff.unchanged.length,
+					onCompare,
 					onConfirm: (selectedProcess, selectedRemove) =>
 						this.executePush(
 							client,
@@ -323,27 +420,53 @@ export default class GitHubSyncPlugin extends Plugin {
 					toProcess,
 					toRemove,
 					unchanged: diff.unchanged.length,
+					onCompare,
 					onConfirm: (selectedProcess, selectedRemove) =>
 						this.executePull(client, selectedProcess, selectedRemove),
 				}).open();
-			} else {
-				if (!smartPlan) throw new Error("智能同步计划生成失败");
+			} else if (mode === "time") {
+				if (!smartPlan) throw new Error("按时间同步计划生成失败");
 				new ConfirmSyncModal(this.app, {
-					mode: "smart",
+					mode: "time",
 					toProcess: smartPlan.previewItems,
 					toRemove: [],
 					unchanged: smartPlan.unchanged,
+					onCompare,
 					onConfirm: (selectedProcess, selectedRemove) => {
-						// 根据用户勾选的 previewItems，重新拆分出 uploads 和 downloads
 						const uploads = selectedProcess.filter((f) => f.direction === "upload");
 						const downloads = selectedProcess.filter((f) => f.direction === "download");
+						const deletions = selectedProcess.filter((f) => f.direction === "delete");
 						return this.executeSmartSync(
 							client,
 							local.files,
 							remote.commitSha,
 							remote.treeSha,
 							uploads,
-							downloads
+							downloads,
+							deletions
+						);
+					},
+				}).open();
+			} else {
+				if (!smartPlan) throw new Error("智能合并计划生成失败");
+				new ConfirmSyncModal(this.app, {
+					mode: "merge",
+					toProcess: smartPlan.previewItems,
+					toRemove: [],
+					unchanged: smartPlan.unchanged,
+					onCompare,
+					onConfirm: async (selectedProcess, selectedRemove) => {
+						const uploads = selectedProcess.filter((f) => f.direction === "upload");
+						const downloads = selectedProcess.filter((f) => f.direction === "download");
+						const merges = selectedProcess.filter((f) => f.direction === "merge");
+						await this.executeMergeSync(
+							client,
+							local.files,
+							remote.commitSha,
+							remote.treeSha,
+							uploads,
+							downloads,
+							merges
 						);
 					},
 				}).open();
@@ -351,9 +474,31 @@ export default class GitHubSyncPlugin extends Plugin {
 		} catch (err) {
 			progress.close();
 			console.error("GitHub Sync error:", err);
-			new Notice(`❌ 同步出错: ${this.getErrorMessage(err)}`);
+			new Notice(`❌ 同步出错: ${getErrorMessage(err)}`);
 		} finally {
-			this.isSyncing = false;
+			this.isPreparing = false;
+		}
+	}
+
+	// ──────────────────────────────────────────────
+	// 回滚
+	// ──────────────────────────────────────────────
+
+	private async openRollback() {
+		if (!this.checkConfig()) return;
+		try {
+			const snapshots = await this.rollbackManager.getSnapshots();
+			new RollbackModal(
+				this.app,
+				snapshots,
+				async (id: string) => {
+					await this.rollbackManager.applySnapshot(id);
+					await this.clearDirtyState();
+					this.rollbackManager.deleteSnapshot(id).catch(err => console.warn("删除已回滚的快照失败:", err));
+				}
+			).open();
+		} catch (err) {
+			new Notice(`❌ 获取历史版本失败: ${getErrorMessage(err)}`);
 		}
 	}
 
@@ -361,7 +506,7 @@ export default class GitHubSyncPlugin extends Plugin {
 	// 智能同步计划
 	// ──────────────────────────────────────────────
 
-	private async buildSmartSyncPlan(
+	private async buildTimeSyncPlan(
 		client: GitHubClient,
 		local: LocalFileSnapshot,
 		remoteFiles: GitHubFile[],
@@ -371,6 +516,7 @@ export default class GitHubSyncPlugin extends Plugin {
 
 		const uploads: FileDiff[] = [];
 		const downloads: FileDiff[] = [];
+		const deletions: FileDiff[] = [];
 
 		// 先处理本地独有文件：必然上传
 		for (const item of diff.toUpload) {
@@ -379,14 +525,9 @@ export default class GitHubSyncPlugin extends Plugin {
 			}
 		}
 
-		// 远端独有文件：必然下载
-		for (const item of diff.toDownload) {
-			if (item.changeType === "added") {
-				downloads.push({
-					...item,
-					direction: "download",
-				});
-			}
+		// 远端独有文件：从远端删除（反映本地删除状态）
+		for (const item of diff.toDelete) {
+			deletions.push({ ...item, direction: "delete" });
 		}
 
 		// 双方都存在但内容不同的文件：按修改时间决定方向
@@ -422,13 +563,94 @@ export default class GitHubSyncPlugin extends Plugin {
 			else downloads.push(enrichedItem);
 		}
 
-		const previewItems = [...uploads, ...downloads].sort((a, b) =>
+		const previewItems = [...uploads, ...downloads, ...deletions].sort((a, b) =>
 			a.path.localeCompare(b.path)
 		);
 
 		return {
 			uploads,
 			downloads,
+			deletions,
+			merges: [],
+			previewItems,
+			unchanged: diff.unchanged.length,
+		};
+	}
+
+	// ──────────────────────────────────────────────
+	// 智能合并计划
+	// ──────────────────────────────────────────────
+
+	private async buildMergePlan(
+		client: GitHubClient,
+		local: LocalFileSnapshot,
+		remoteFiles: GitHubFile[],
+		diff: DiffResult
+	): Promise<SmartSyncPlan> {
+		const remoteMap = new Map(remoteFiles.map((f) => [f.path, f] as const));
+
+		const uploads: FileDiff[] = [];
+		const downloads: FileDiff[] = [];
+		const merges: FileDiff[] = [];
+
+		// 本地独有文件：上传
+		for (const item of diff.toUpload) {
+			if (item.changeType === "added") {
+				uploads.push({ ...item, direction: "upload" });
+			}
+		}
+
+		// 远端独有文件：下载
+		for (const item of diff.toDownload) {
+			if (item.changeType === "added") {
+				downloads.push({ ...item, direction: "download" });
+			}
+		}
+
+		// 双方都存在但内容不同的文件：自动合并（文本）或按时间（二进制）
+		const modifiedPaths = diff.toUpload
+			.filter((item) => item.changeType === "modified")
+			.map((item) => item.path);
+
+		const remoteModTimes =
+			modifiedPaths.length > 0
+				? await client.getFileModTimes(modifiedPaths)
+				: new Map<string, number>();
+
+		for (const item of diff.toUpload) {
+			if (item.changeType !== "modified") continue;
+
+			const path = item.path;
+			const localMtime = local.mtimes.get(path) ?? 0;
+			const remoteMtime =
+				remoteModTimes.get(path) ??
+				remoteMap.get(path)?.remoteMtime ??
+				0;
+
+			if (isTextFile(path)) {
+				merges.push({
+					...item,
+					localMtime,
+					remoteMtime,
+					direction: "merge",
+				});
+			} else {
+				// 二进制文件按时间决定方向
+				const target = localMtime >= remoteMtime ? "upload" : "download";
+				const enrichedItem: FileDiff = { ...item, localMtime, remoteMtime, direction: target };
+				if (target === "upload") uploads.push(enrichedItem);
+				else downloads.push(enrichedItem);
+			}
+		}
+
+		const previewItems = [...uploads, ...downloads, ...merges].sort((a, b) =>
+			a.path.localeCompare(b.path)
+		);
+
+		return {
+			uploads,
+			downloads,
+			merges,
 			previewItems,
 			unchanged: diff.unchanged.length,
 		};
@@ -452,6 +674,15 @@ export default class GitHubSyncPlugin extends Plugin {
 			0
 		);
 		try {
+			// 快照 I/O 与网络 I/O 并行（Push 不改本地文件，无顺序约束）
+			const preSyncPaths = [
+				...toUpload.map((f) => f.path),
+				...toDelete.map((f) => f.path),
+			].filter((p) => p);
+			const snapshotPromise = preSyncPaths.length > 0
+				? this.collectPreSyncFiles(preSyncPaths).then(c => this.rollbackManager.saveSnapshot(c))
+				: Promise.resolve();
+
 			const message = this.buildCommitMessage();
 
 			if (toUpload.length > 0) {
@@ -483,13 +714,15 @@ export default class GitHubSyncPlugin extends Plugin {
 				);
 			}
 
+			await snapshotPromise;
+
 			startNotice.hide();
 			new Notice(`✅ Push 完成：上传 ${toUpload.length}，删除 ${toDelete.length}`);
-			await this.clearDirtyState(); // 新增：同步成功，重置状态
+			await this.clearDirtyState();
 		} catch (err) {
 			startNotice.hide();
 			console.error("Push error:", err);
-			new Notice(`❌ Push 出错: ${this.getErrorMessage(err)}`);
+			new Notice(`❌ Push 出错: ${getErrorMessage(err)}`);
 		} finally {
 			this.isSyncing = false;
 		}
@@ -504,26 +737,39 @@ export default class GitHubSyncPlugin extends Plugin {
 		toRemove: FileDiff[]
 	) {
 		this.isSyncing = true;
-		// 核心修复：加入冷却池，防止写入后延迟触发的 modify 事件被误判
 		toDownload.forEach(f => this.recentlySyncedPaths.add(f.path));
 		const startNotice = new Notice(
 			`⬇️ 开始 Pull，下载 ${toDownload.length}，删除 ${toRemove.length}...`,
 			0
 		);
 		try {
-			// 下载 / 覆盖文件（并发下载，顺序写入）
+			// 快照 I/O 与网络下载并行
+			const preSyncPaths = [
+				...toDownload.map((f) => f.path),
+				...toRemove.map((f) => f.path),
+			].filter((p) => p);
+			const snapshotPromise = preSyncPaths.length > 0
+				? this.collectPreSyncFiles(preSyncPaths).then(c => this.rollbackManager.saveSnapshot(c))
+				: Promise.resolve();
+
+			// 网络下载（与快照 I/O 并行）
+			let downloaded = new Map<string, ArrayBuffer>();
 			if (toDownload.length > 0) {
 				const filesToDownload = toDownload.map((f) => ({ path: f.path, sha: f.remoteSha }));
-				const downloaded = await client.downloadFiles(filesToDownload);
+				downloaded = await client.downloadFiles(filesToDownload);
+			}
 
-				for (const { path } of filesToDownload) {
+			// 等待快照完成后再写本地
+			await snapshotPromise;
+
+			if (toDownload.length > 0) {
+				for (const { path } of toDownload) {
 					const content = downloaded.get(path);
 					if (!content) continue;
 					await this.writeLocalFile(path, content);
 				}
 			}
 
-			// 删除本地多余文件
 			for (const f of toRemove) {
 				await this.deleteLocalFile(f.path);
 			}
@@ -532,14 +778,13 @@ export default class GitHubSyncPlugin extends Plugin {
 			new Notice(
 				`✅ Pull 完成：下载 ${toDownload.length}，删除 ${toRemove.length}`
 			);
-			await this.clearDirtyState(); // 新增：同步成功，重置状态
+			await this.clearDirtyState();
 		} catch (err) {
 			startNotice.hide();
 			console.error("Pull error:", err);
-			new Notice(`❌ Pull 出错: ${this.getErrorMessage(err)}`);
+			new Notice(`❌ Pull 出错: ${getErrorMessage(err)}`);
 		} finally {
 			this.isSyncing = false;
-			// 2秒后解除冷却
 			setTimeout(() => {
 				toDownload.forEach(f => this.recentlySyncedPaths.delete(f.path));
 			}, 2000);
@@ -556,7 +801,8 @@ export default class GitHubSyncPlugin extends Plugin {
 		currentCommitSha: string | null,
 		currentTreeSha: string | null,
 		uploads: FileDiff[],
-		downloads: FileDiff[]
+		downloads: FileDiff[],
+		toDeleteFromRemote: FileDiff[] = []
 	) {
 		this.isSyncing = true;
 		downloads.forEach(f => this.recentlySyncedPaths.add(f.path));
@@ -566,10 +812,148 @@ export default class GitHubSyncPlugin extends Plugin {
 			0
 		);
 		try {
+			// 快照 I/O 与网络 I/O 并行
+			const preSyncPaths = [
+				...uploads.map((f) => f.path),
+				...downloads.map((f) => f.path),
+				...toDeleteFromRemote.map((f) => f.path),
+			].filter((p) => p);
+			const snapshotPromise = preSyncPaths.length > 0
+				? this.collectPreSyncFiles(preSyncPaths).then(c => this.rollbackManager.saveSnapshot(c))
+				: Promise.resolve();
+
 			const message = this.buildCommitMessage();
 
-			if (uploads.length > 0) {
-				const filesToUpload = uploads
+			const uploadPromise = uploads.length > 0
+				? client.batchUpload(
+					uploads
+						.map((f) => {
+							const content = localFiles.get(f.path);
+							if (!content) return null;
+							return { path: f.path, content };
+						})
+						.filter(Boolean) as { path: string; content: ArrayBuffer }[],
+					message,
+					currentCommitSha,
+					currentTreeSha
+				  ).then(r => ({ commitSha: r.newCommitSha, treeSha: r.newTreeSha }))
+				: Promise.resolve(null);
+
+			const downloadPromise = downloads.length > 0
+				? client.downloadFiles(
+					downloads.map((f) => ({ path: f.path, sha: f.remoteSha }))
+				  )
+				: Promise.resolve(new Map<string, ArrayBuffer>());
+
+			const [uploadResult, downloaded] = await Promise.all([uploadPromise, downloadPromise]);
+
+			// 等待快照完成后再写本地
+			await snapshotPromise;
+
+			// 删除远端文件（需要 upload 之后的 sha）
+			if (toDeleteFromRemote.length > 0) {
+				const delCommitSha = uploadResult?.commitSha ?? currentCommitSha;
+				const delTreeSha = uploadResult?.treeSha ?? currentTreeSha;
+				if (delCommitSha && delTreeSha) {
+					const delMessage = this.buildCommitMessage();
+					await client.batchDelete(
+						toDeleteFromRemote.map((f) => ({ path: f.path })),
+						delMessage,
+						delCommitSha,
+						delTreeSha
+					);
+				}
+			}
+
+			for (const f of downloads) {
+				const content = downloaded.get(f.path);
+				if (!content) continue;
+				await this.writeLocalFile(f.path, content);
+			}
+
+			startNotice.hide();
+			new Notice(
+				`✅ 智能同步完成：上传 ${uploads.length}，下载 ${downloads.length}，删除 ${toDeleteFromRemote.length}`
+			);
+			await this.clearDirtyState();
+		} catch (err) {
+			startNotice.hide();
+			console.error("Smart sync error:", err);
+			new Notice(`❌ 智能同步出错: ${getErrorMessage(err)}`);
+		} finally {
+			this.isSyncing = false;
+			setTimeout(() => {
+				downloads.forEach(f => this.recentlySyncedPaths.delete(f.path));
+			}, 2000);
+		}
+	}
+
+	// ──────────────────────────────────────────────
+	// 执行智能合并
+	// ──────────────────────────────────────────────
+
+	private async executeMergeSync(
+		client: GitHubClient,
+		localFiles: Map<string, ArrayBuffer>,
+		currentCommitSha: string | null,
+		currentTreeSha: string | null,
+		uploads: FileDiff[],
+		downloads: FileDiff[],
+		merges: FileDiff[]
+	) {
+		this.isSyncing = true;
+		downloads.forEach(f => this.recentlySyncedPaths.add(f.path));
+		merges.forEach(f => this.recentlySyncedPaths.add(f.path));
+
+		const startNotice = new Notice(
+			`🔀 开始合并同步，上传 ${uploads.length}，下载 ${downloads.length}，合并 ${merges.length}...`,
+			0
+		);
+		try {
+			// Phase 1：快照 I/O + 所有网络请求并行
+			const preSyncPaths = [
+				...uploads.map((f) => f.path),
+				...downloads.map((f) => f.path),
+				...merges.map((f) => f.path),
+			].filter((p) => p);
+			const snapshotPromise = preSyncPaths.length > 0
+				? this.collectPreSyncFiles(preSyncPaths).then(c => this.rollbackManager.saveSnapshot(c))
+				: Promise.resolve();
+
+			const message = this.buildCommitMessage();
+
+			// 并行获取 merge 远程内容 + 下载文件
+			const mergeDownloadsPromise = Promise.all(
+				merges.map(async (item) => {
+					const rc = await client.downloadFile(item.path, item.remoteSha).catch(() => null);
+					return { item, remoteContent: rc };
+				})
+			);
+
+			const downloadPromise = downloads.length > 0
+				? client.downloadFiles(
+					downloads.map((f) => ({ path: f.path, sha: f.remoteSha }))
+				  )
+				: Promise.resolve(new Map<string, ArrayBuffer>());
+
+			const [mergeDownloads, downloaded] = await Promise.all([mergeDownloadsPromise, downloadPromise]);
+			await snapshotPromise;
+
+			// Phase 2：合并写入（顺序），然后上传
+			for (const { item, remoteContent } of mergeDownloads) {
+				if (!remoteContent) continue;
+				const localBuf = localFiles.get(item.path);
+				if (!localBuf) continue;
+				const localText = new TextDecoder().decode(localBuf);
+				const remoteText = new TextDecoder().decode(remoteContent);
+				const mergedText = mergeTexts(localText, remoteText);
+				const mergedBuf = strToArrayBuffer(mergedText);
+				await this.writeLocalFile(item.path, mergedBuf);
+				localFiles.set(item.path, mergedBuf);
+			}
+
+			if (uploads.length > 0 || merges.length > 0) {
+				const filesToUpload = [...uploads, ...merges]
 					.map((f) => {
 						const content = localFiles.get(f.path);
 						if (!content) return null;
@@ -578,40 +962,30 @@ export default class GitHubSyncPlugin extends Plugin {
 					.filter(Boolean) as { path: string; content: ArrayBuffer }[];
 
 				if (filesToUpload.length > 0) {
-					const uploadResult = await client.batchUpload(
-						filesToUpload,
-						message,
-						currentCommitSha,
-						currentTreeSha
+					await client.batchUpload(
+						filesToUpload, message, currentCommitSha, currentTreeSha
 					);
-					currentCommitSha = uploadResult.newCommitSha;
-					currentTreeSha = uploadResult.newTreeSha;
 				}
 			}
 
-			if (downloads.length > 0) {
-				const filesToDownload = downloads.map((f) => ({ path: f.path, sha: f.remoteSha }));
-				const downloaded = await client.downloadFiles(filesToDownload);
-				for (const { path } of filesToDownload) {
-					const content = downloaded.get(path);
-					if (!content) continue;
-					await this.writeLocalFile(path, content);
-				}
+			// Phase 3：下载写入本地
+			for (const f of downloads) {
+				const content = downloaded.get(f.path);
+				if (!content) continue;
+				await this.writeLocalFile(f.path, content);
 			}
 
 			startNotice.hide();
-			new Notice(
-				`✅ 智能同步完成：上传 ${uploads.length}，下载 ${downloads.length}`
-			);
+			new Notice(`✅ 合并同步完成：上传 ${uploads.length}，下载 ${downloads.length}，合并 ${merges.length}`);
 			await this.clearDirtyState();
 		} catch (err) {
 			startNotice.hide();
-			console.error("Smart sync error:", err);
-			new Notice(`❌ 智能同步出错: ${this.getErrorMessage(err)}`);
+			console.error("Merge sync error:", err);
+			new Notice(`❌ 合并同步出错: ${getErrorMessage(err)}`);
 		} finally {
 			this.isSyncing = false;
 			setTimeout(() => {
-				downloads.forEach(f => this.recentlySyncedPaths.delete(f.path));
+				[...downloads, ...merges].forEach(f => this.recentlySyncedPaths.delete(f.path));
 			}, 2000);
 		}
 	}
@@ -624,7 +998,7 @@ export default class GitHubSyncPlugin extends Plugin {
 		const files = this.app.vault.getFiles();
 		const filtered = files.filter((file) => !this.shouldIgnoreLocal(file.path, ignore));
 
-		const items = await this.pMap(
+		const items = await pMap(
 			filtered,
 			async (file) => {
 				try {
@@ -685,33 +1059,16 @@ export default class GitHubSyncPlugin extends Plugin {
 		let current = "";
 		for (const part of parts) {
 			current = current ? `${current}/${part}` : part;
-			const existing = this.app.vault.getAbstractFileByPath(current);
+			const norm = normalizePath(current);
+			const existing = this.app.vault.getAbstractFileByPath(norm);
 			if (!existing) {
-				await this.app.vault.createFolder(current).catch(() => {});
+				try {
+					await this.app.vault.createFolder(norm);
+				} catch (err) {
+					// 并发创建文件夹时可能冲突，忽略
+				}
 			}
 		}
-	}
-
-	private async pMap<T, R>(
-		items: T[],
-		fn: (item: T) => Promise<R>,
-		concurrency: number
-	): Promise<R[]> {
-		if (items.length === 0) return [];
-		const results: R[] = new Array(items.length);
-		let index = 0;
-		const workerCount = Math.min(concurrency, items.length);
-
-		const worker = async () => {
-			while (true) {
-				const current = index++;
-				if (current >= items.length) break;
-				results[current] = await fn(items[current]);
-			}
-		};
-
-		await Promise.all(Array.from({ length: workerCount }, () => worker()));
-		return results;
 	}
 
 	// ──────────────────────────────────────────────
@@ -733,21 +1090,25 @@ export default class GitHubSyncPlugin extends Plugin {
 	}
 
 	private shouldIgnoreLocal(path: string, ignore: string[]): boolean {
+		const normalized = path.replace(/\\/g, "/");
 		for (const prefix of ignore) {
-			if (path === prefix || path.startsWith(prefix + "/")) return true;
+			const p = prefix.replace(/\\/g, "/");
+			if (normalized === p || normalized.startsWith(p + "/")) return true;
 		}
 		return false;
+	}
+
+	private shouldIgnoreBySettings(path: string): boolean {
+		const ignores = this.settings.ignorePaths
+			.split("\n")
+			.map(s => s.trim())
+			.filter(Boolean);
+		return this.shouldIgnoreLocal(path, ignores);
 	}
 
 	private buildCommitMessage(): string {
 		const now = new Date().toISOString().replace("T", " ").substring(0, 19);
 		return this.settings.commitMessage.replace("{date}", now);
-	}
-
-	private getErrorMessage(err: unknown): string {
-		if (err instanceof Error) return err.message;
-		if (typeof err === "string") return err;
-		return "未知错误";
 	}
 
 	// ──────────────────────────────────────────────
@@ -763,202 +1124,4 @@ export default class GitHubSyncPlugin extends Plugin {
 	}
 }
 
-const CSS = `
-/* ===== GitHub Sync Plugin Styles ===== */
 
-.github-sync-modal {
-  padding: 8px 4px;
-}
-
-.github-sync-modal h2 {
-  margin-bottom: 8px;
-}
-
-.github-sync-subtitle {
-  color: var(--text-muted);
-  margin-bottom: 20px;
-}
-
-/* 全选按钮 */
-.github-sync-select-all-btn {
-margin-bottom: 8px;
-font-size: 0.85em;
-padding: 4px 10px;
-cursor: pointer;
-border-radius: 4px;
-background: var(--background-secondary);
-border: 1px solid var(--background-modifier-border);
-color: var(--text-muted);
-transition: all 0.15s ease;
-}
-.github-sync-select-all-btn:hover {
-background: var(--background-modifier-hover);
-color: var(--text-normal);
-}
-
-/* 模式选择按钮 */
-.github-sync-mode-buttons {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 16px;
-  margin: 12px 0 8px;
-}
-
-.github-sync-mode-btn {
-  flex: 1 1 180px;
-  padding: 20px 16px;
-  border: 2px solid var(--background-modifier-border);
-  border-radius: 10px;
-  background: var(--background-secondary);
-  cursor: pointer;
-  text-align: center;
-  transition: all 0.15s ease;
-}
-
-.github-sync-mode-btn:hover {
-  border-color: var(--interactive-accent);
-  background: var(--background-modifier-hover);
-  transform: translateY(-1px);
-}
-
-.github-sync-mode-icon {
-  font-size: 2em;
-  margin-bottom: 8px;
-}
-
-.github-sync-mode-label {
-  font-size: 1.1em;
-  font-weight: 600;
-  color: var(--text-normal);
-  margin-bottom: 4px;
-}
-
-.github-sync-mode-desc {
-  font-size: 0.82em;
-  color: var(--text-muted);
-}
-
-/* 摘要徽章 */
-.github-sync-summary {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin: 12px 0;
-}
-
-.github-sync-badge {
-  padding: 4px 10px;
-  border-radius: 20px;
-  font-size: 0.85em;
-  font-weight: 500;
-}
-
-.badge-added    { background: rgba(40, 167, 69, 0.15); color: #28a745; }
-.badge-modified { background: rgba(255, 165, 0, 0.15); color: #e6922a; }
-.badge-deleted  { background: rgba(220, 53, 69, 0.15); color: #dc3545; }
-.badge-unchanged{ background: var(--background-modifier-border); color: var(--text-muted); }
-
-/* 文件列表 */
-.github-sync-file-list {
-  max-height: 280px;
-  overflow-y: auto;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 6px;
-  padding: 6px;
-  margin: 8px 0;
-  background: var(--background-primary-alt);
-  font-family: var(--font-monospace);
-  font-size: 0.82em;
-}
-
-.github-sync-file-row {
-display: flex;
-align-items: center;
-gap: 6px;
-padding: 4px 6px;
-border-radius: 4px;
-cursor: pointer;
-user-select: none;
-}
-
-.github-sync-file-row:hover {
-  background: var(--background-modifier-hover);
-}
-  
-.github-sync-file-row input[type="checkbox"] {
-margin: 0;
-cursor: pointer;
-flex-shrink: 0;
-}
-
-.file-icon { flex-shrink: 0; }
-
-.file-path { 
-  overflow: hidden; 
-  text-overflow: ellipsis; 
-  white-space: nowrap;
-  color: var(--text-normal);
-}
-
-/* 核心颜色语义重构 */
-.file-added    { color: #28a745; } /* 绿色：Push 新增 */
-.file-download { color: #28a745; } /* 绿色：Smart/Pull 下载 */
-.file-modified { color: #e6922a; } /* 橙色：内容修改 */
-.file-upload   { color: #0366d6; } /* 蓝色：Smart 上传 */
-.file-deleted  { color: #dc3545; text-decoration: line-through; } /* 红色：删除 */
-
-.github-sync-more {
-  color: var(--text-muted);
-  font-size: 0.82em;
-  text-align: center;
-  margin: 4px 0 0;
-}
-
-/* 警告文字 */
-.github-sync-warning {
-  color: var(--text-muted);
-  font-size: 0.85em;
-  margin: 12px 0 4px;
-}
-
-.github-sync-no-changes {
-  color: var(--text-success, #28a745);
-  font-size: 1em;
-  margin: 16px 0;
-}
-
-/* 进度条 */
-.github-sync-progress-modal { text-align: center; padding: 24px 16px; }
-.github-sync-progress-msg { color: var(--text-muted); margin: 8px 0 20px; min-height: 1.4em; }
-.github-sync-progress-bar-wrap { width: 100%; height: 8px; background: var(--background-modifier-border); border-radius: 4px; overflow: hidden; }
-.github-sync-progress-bar-fill { height: 100%; background: var(--interactive-accent); border-radius: 4px; width: 0%; transition: width 0.3s ease; }
-
-
-.github-sync-progress-msg {
-  color: var(--text-muted);
-  margin: 8px 0 20px;
-  min-height: 1.4em;
-}
-
-.github-sync-progress-bar-wrap {
-  width: 100%;
-  height: 8px;
-  background: var(--background-modifier-border);
-  border-radius: 4px;
-  overflow: hidden;
-}
-
-.github-sync-progress-bar-fill {
-  height: 100%;
-  background: var(--interactive-accent);
-  border-radius: 4px;
-  width: 0%;
-  transition: width 0.3s ease;
-}
-
-/* 设置页 */
-.github-sync-settings .setting-item-description a {
-  color: var(--link-color);
-  text-decoration: underline;
-}
-`;

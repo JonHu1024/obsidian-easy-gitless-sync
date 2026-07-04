@@ -1,5 +1,7 @@
 // github.ts — GitHub REST API (no local git required)
 
+import { pMap, arrayBufferToBase64 } from "./utils";
+
 export interface GitHubFile {
 	path: string;
 	sha: string;
@@ -7,6 +9,13 @@ export interface GitHubFile {
 	type: "blob" | "tree";
 	/** 远端文件的最后提交时间（Unix ms），仅智能同步时填充 */
 	remoteMtime?: number;
+}
+
+export interface FileWithCommitInfo {
+	content: ArrayBuffer | null;
+	commitMessage: string;
+	commitDate: string;
+	size: number;
 }
 
 export interface TreeItem {
@@ -22,41 +31,6 @@ export interface TreeItem {
 const BLOB_CONCURRENCY = 10;   // 创建 blob 并发数
 const DOWNLOAD_CONCURRENCY = 8; // 下载文件并发数
 const MTIME_CONCURRENCY = 6;    // 查询文件修改时间并发（此接口限速更严）
-
-export async function pMap<T, R>(
-	items: T[],
-	fn: (item: T) => Promise<R>,
-	concurrency: number
-): Promise<R[]> {
-	if (items.length === 0) return [];
-	const results: R[] = new Array(items.length);
-	let idx = 0;
-	async function worker() {
-		while (idx < items.length) {
-			const i = idx++;
-			results[i] = await fn(items[i]);
-		}
-	}
-	const workers = Array.from(
-		{ length: Math.min(concurrency, items.length) },
-		worker
-	);
-	await Promise.all(workers);
-	return results;
-}
-
-// ─── base64（O(n) 分块版，避免字符串拼接 O(n²) 及 call stack overflow）────
-export function arrayBufferToBase64(buffer: ArrayBuffer): string {
-	const bytes = new Uint8Array(buffer);
-	const chunkSize = 0x8000; // 32 KB
-	let binary = "";
-	for (let i = 0; i < bytes.length; i += chunkSize) {
-		binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-	}
-	return btoa(binary);
-}
-
-// ──────────────────────────────────────────────────────────────────────────
 
 export class GitHubClient {
 	private token: string;
@@ -204,7 +178,69 @@ export class GitHubClient {
 		return result;
 	}
 
-	// ... 前面的代码保持不变 ...
+	// ──────────────────────────────────────────────────────────
+	// 获取文件内容 + 提交信息（供对比功能使用）
+	// ──────────────────────────────────────────────────────────
+
+	/**
+	 * 批量获取指定文件的内容和最近一次提交信息。
+	 * 对每个文件并发请求 /contents/{path}（获取内容）和 /commits（获取提交信息）。
+	 * 单个文件失败不中断整体流程。
+	 */
+	async getFilesWithCommits(paths: string[]): Promise<Map<string, FileWithCommitInfo>> {
+		const result = new Map<string, FileWithCommitInfo>();
+
+		await pMap(
+			paths,
+			async (path) => {
+				try {
+					const [contentBuf, commitMsg] = await Promise.all([
+						this.downloadFile(path).catch(() => null as ArrayBuffer | null),
+						this.getFileLastCommit(path),
+					]);
+
+					result.set(path, {
+						content: contentBuf,
+						commitMessage: commitMsg?.message ?? "",
+						commitDate: commitMsg?.date ?? "",
+						size: contentBuf?.byteLength ?? 0,
+					});
+				} catch {
+					result.set(path, {
+						content: null,
+						commitMessage: "",
+						commitDate: "",
+						size: 0,
+					});
+				}
+			},
+			DOWNLOAD_CONCURRENCY
+		);
+
+		return result;
+	}
+
+	/**
+	 * 获取单个文件在分支上的最后一次提交信息。
+	 * 返回 { message, date } 或 null。
+	 */
+	private async getFileLastCommit(path: string): Promise<{ message: string; date: string } | null> {
+		try {
+			const resp = await this.request(
+				`/commits?path=${encodeURIComponent(path)}&per_page=1&sha=${this.branch}`
+			);
+			if (!resp.ok) return null;
+			const commits = await resp.json();
+			if (commits.length === 0) return null;
+			const c = commits[0].commit;
+			return {
+				message: c?.message ?? "",
+				date: c?.committer?.date ?? c?.author?.date ?? "",
+			};
+		} catch {
+			return null;
+		}
+	}
 
 /** 下载单个文件（使用 API 以支持私有仓库及避免 raw 域名网络问题） */
 async downloadFile(path: string, sha?: string): Promise<ArrayBuffer> {
@@ -215,8 +251,8 @@ async downloadFile(path: string, sha?: string): Promise<ArrayBuffer> {
 		});
 		if (resp.ok) return resp.arrayBuffer();
 	}
-	// 回退到 Contents API（兜底）
-	const resp = await this.request(`/contents/${encodePath(path)}`, {
+	// 回退到 Contents API（兜底，指定分支确保最新）
+	const resp = await this.request(`/contents/${encodePath(path)}?ref=${encodeURIComponent(this.branch)}`, {
 		headers: { Accept: "application/vnd.github.raw" },
 	});
 	if (!resp.ok) throw new Error(`下载 ${path} 失败: HTTP ${resp.status}`);

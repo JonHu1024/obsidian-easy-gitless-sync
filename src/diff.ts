@@ -1,6 +1,7 @@
 // diff.ts — 计算本地与 GitHub 之间的差异（仅对比变化的文件）
 
-import { pMap, GitHubFile } from "./github";
+import { pMap } from "./utils";
+import type { GitHubFile } from "./github";
 
 export type ChangeType = "added" | "modified" | "deleted" | "unchanged";
 export type SyncDirection = "upload" | "download" | "delete";
@@ -156,4 +157,47 @@ function shouldIgnore(path: string, ignorePaths: string[]): boolean {
 		if (path === prefix || path.startsWith(prefix + "/")) return true;
 	}
 	return false;
+}
+
+// ──────────────────────────────────────────────
+// 文本 Diff 与合并（使用 Google diff-match-patch）
+// 对比渲染由 @codemirror/merge 处理，此处仅负责合并计算
+// ──────────────────────────────────────────────
+
+import { diff_match_patch, DIFF_EQUAL, DIFF_DELETE, DIFF_INSERT } from "diff-match-patch";
+
+const TEXT_EXTENSIONS = new Set([
+	".md", ".txt", ".json", ".yaml", ".yml", ".xml",
+	".html", ".css", ".js", ".ts", ".mjs", ".cjs",
+	".py", ".sh", ".toml", ".ini", ".cfg", ".env", ".log",
+	".csv", ".tsv", ".svg",
+]);
+
+export function isTextFile(path: string): boolean {
+	const dot = path.lastIndexOf(".");
+	if (dot === -1) return false;
+	const ext = path.slice(dot).toLowerCase();
+	return TEXT_EXTENSIONS.has(ext);
+}
+
+const dmp = new diff_match_patch();
+
+/**
+ * 使用 Google diff-match-patch 进行 union merge。
+ * 两端字符级差异均保留，不丢失任何修改。
+ *
+ * 限制：无共同祖先时无法做 3-way merge，
+ * 同一位置双方都修改会产生冗余内容，需人工清理。
+ */
+export function mergeTexts(localText: string, remoteText: string): string {
+	const diffs = dmp.diff_main(localText, remoteText);
+	dmp.diff_cleanupSemantic(diffs);
+
+	let result = "";
+	for (const [op, text] of diffs) {
+		if (op === DIFF_EQUAL || op === DIFF_INSERT || op === DIFF_DELETE) {
+			result += text;
+		}
+	}
+	return result;
 }
