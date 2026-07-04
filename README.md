@@ -29,7 +29,7 @@ Obsidian同步到Github的简单插件, 不依赖本地的Git, 只需要简单�
 虽然针对PC端开发, 但实测核心功能对任何平台都有效, 使用的方法也都相同.
 
 由于没有添加到Obsidian的官方商店, 目前只能手动导入.
-1. 下载本项目里的`main.js`和`manifest.json`.(或者从release里下载压缩包)
+1. 从release里下载本项目里的`main.js`和`manifest.json`.
 2. 在文件管理器中打开当前Obsidian的工作目录,显示隐藏文件(夹)后进入`.obsidian`目录,在`plugins`目录(没有就需要自己创建)下创建名为`github-sync-simple`的目录(不要擅自修改).
 3. 将下载的`main.js`和`manifest.json`放在`.obsidian/plugins/github-sync-simple`目录下,重启obsidian,在设置里打开本仓库的插件模式后就能看到本插件以及成功加载,此时在Obsidian的最左栏应该可以看到github的图标.
 4. 配置:在Github上新建一个**私人仓库**用于同步, 在Obsidian中进入本插件的设置界面,然后填写自己的GithubToken(`ghp`开头的那个,这个不清楚可以直接按AI提供的额操作步骤来), 以及相关同步仓库即可使用.
