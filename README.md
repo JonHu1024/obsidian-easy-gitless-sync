@@ -1,8 +1,8 @@
-## github-sync-simple For Obsidian
+## easy-gitless-sync For Obsidian
 Obsidian同步到Github的简单插件, 不依赖本地的Git, 只需要简单配置Github token, 目前尚未上架Obsidian官方商店, 在保证同步速度的同时将同步模式的选择权留给用户.
 
 ### 为何开发
-- 同步的时候本地和云端往往存在冲突文件, 如果我们修改了本地的文件结构(比如建立文件夹归档文件), 一般的同步插件往会因为变化过大而放弃同步; 再比如我们删除了某些不重要的文件, 执行同步时, 一般的同步插件会默认从云端把那些我们不想要的文件再次下载回来……总之, **同步时处理冲突文件的选择权不在用户**.于是在现有插件都不满足我的这个需求的情况下, 我参考项目[github-gitless-sync](https://github.com/silvanocerza/github-gitless-sync)的思路, 借助`claude code`和`opencode`(接入`Deepseek`), 开发了这个小插件.
+- 同步的时候本地和云端往往存在冲突文件, 如果我们修改了本地的文件结构(比如建立文件夹归档文件), 一般的同步插件往会因为变化过大而放弃同步; 再比如我们删除了某些不重要的文件, 执行同步时, 一般的同步插件会默认从云端把那些我们不想要的文件再次下载回来……总之, **同步时处理冲突文件的选择权不在用户**.于是在现有插件都不满足我的这个需求的情况下, 参考项目[github-gitless-sync](https://github.com/silvanocerza/github-gitless-sync)的思路, 开发了此项目.
 
 ### 插件功能
 - **控制反转(Inverse of Control)**:这里借用Java Spring框架的术语, 意为此插件**将同步时处理冲突文件的选择权交给用户**, 由用户自由选择同步的基准(本地、云端、修改时间)和需要进行同步的文件，所以我设计了四种模式(见下文), 而且在确认执行同步之前, 我们会先对比当下文件与云端(github)文件的所有不同, 并将所要进行的上传/下载、删除/修改操作以复选框的形式全部列出, 让用户心中有数.
@@ -22,14 +22,19 @@ Obsidian同步到Github的简单插件, 不依赖本地的Git, 只需要简单�
 每次同步的时候, 对与不放心的文件可以点击对比按钮, 显示差异; 未同步状态下点击同步状态栏也会触发文件的差异内容对比展示.
 - **回滚操作**(1.1新增)
   为了避免可能出现的同步问题, 在同步时, 我们将会为您的旧有项目做一次备份处理存储在本地(插件目录下的`savings`文件夹)并在ui界面提供回滚的操作, 目前版本存储两个历史版本.
+- **`.obsidian`目录同步支持**(1.2 新增)
+  此同步插件也支持对`.obsidian`下的文件上传和下载, 用户可以在设计界面选定, 如果用户有使用自己开发的Obsidian插件的需求, 可以在电脑端开发完成后, 使用插件的同步功能分发到其他端.
   
   **注意**:每次回滚保留的历史版本只包含同步过程中涉及到的文件(差量同步), 因此回滚的时候也只会回滚历史记录中同步过的那部分差量文件, 对于上次未参与同步过程中的文件的修改, 是无法通过本插件修改的.
 
-### 使用说明
+### Getting Started/使用说明
 虽然针对PC端开发, 但实测核心功能对任何平台都有效, 使用的方法也都相同.
 
 由于没有添加到Obsidian的官方商店, 目前只能手动导入.
 1. 从release里下载本项目里的`main.js`和`manifest.json`.
-2. 在文件管理器中打开当前Obsidian的工作目录,显示隐藏文件(夹)后进入`.obsidian`目录,在`plugins`目录(没有就需要自己创建)下创建名为`github-sync-simple`的目录(不要擅自修改).
-3. 将下载的`main.js`和`manifest.json`放在`.obsidian/plugins/github-sync-simple`目录下,重启obsidian,在设置里打开本仓库的插件模式后就能看到本插件以及成功加载,此时在Obsidian的最左栏应该可以看到github的图标.
-4. 配置:在Github上新建一个**私人仓库**用于同步, 在Obsidian中进入本插件的设置界面,然后填写自己的GithubToken(`ghp`开头的那个,这个不清楚可以直接按AI提供的额操作步骤来), 以及相关同步仓库即可使用.
+2. 在文件管理器中打开当前Obsidian的工作目录,显示隐藏文件(夹)后进入`.obsidian`目录,在`plugins`目录(没有就需要自己创建)下创建名为`easy-gitless-sync`的目录(不要擅自修改).
+3. 将下载的`main.js`和`manifest.json`放在`.obsidian/plugins/easy-gitless-sync`目录下,重启obsidian,在设置里打开本仓库的插件模式后就能看到本插件以及成功加载,此时在Obsidian的最左栏应该可以看到github的图标.
+4. 配置:在Github上新建一个**私人仓库**用于同步, 在Obsidian中进入本插件的设置界面,然后填写自己的GithubToken(`ghp`开头的那个, 见下文或者询问AI), 以及相关同步仓库即可使用.
+
+###### GithubToken的获取
+登录Github后, 头像->`Settings`->左侧边栏底部`Developer Settings`->左侧菜单`Personal access tokens`->`Tokens(classic)`->`Generate new token`->`Generate new token(Classic)`->`Note`描述性名称随意, `Expiration`可以选择`No Expiration`方便长期使用; `Select scopes`需要勾选`repo`以访问你的私有笔记仓库->`Generate token`->复制并保存以`ghp_`开头的字符串(注意离开当前页面后此token不再可以访问, 需要重新生成)
