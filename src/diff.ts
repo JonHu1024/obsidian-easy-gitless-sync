@@ -1,10 +1,9 @@
-// diff.ts — 计算本地与 GitHub 之间的差异（仅对比变化的文件）
+// diff.ts — 计算本地与 GitHub 之间的差异(仅对比变化的文件)
 
-import { pMap } from "./utils";
 import type { GitHubFile } from "./github";
 
 export type ChangeType = "added" | "modified" | "deleted" | "unchanged";
-export type SyncDirection = "upload" | "download" | "delete";
+export type SyncDirection = "upload" | "download" | "delete" | "merge";
 
 export interface FileDiff {
 	path: string;
@@ -23,20 +22,24 @@ export interface DiffResult {
 	unchanged: FileDiff[];
 }
 
-const HASH_CONCURRENCY = 8;
-
 /**
  * 计算本地文件与 GitHub 文件树的差异
  * 使用 GitHub blob SHA（实为 git hash）与本地文件内容 hash 对比
  *
- * @param localFiles  本地文件列表: path -> ArrayBuffer
+ * @param localFiles  本地文件列表： path -> 内容（未变化的文件内容可为 null，
+ *                    此时其 sha 必须已存在于 localShas 中）
+ * @param localShas   本地文件 git blob sha（读取阶段预计算/缓存，避免二次哈希）
  * @param remoteFiles GitHub 文件列表
  * @param ignorePaths 忽略的路径前缀（如 .obsidian）
+ * @param extraIgnore 额外的忽略判定（如 .obsidian 中未被选中同步的子项，
+ *                    对本地与远端同时生效，避免被当作差异）
  */
 export async function computeDiff(
-	localFiles: Map<string, ArrayBuffer>,
+	localFiles: Map<string, ArrayBuffer | null>,
+	localShas: Map<string, string>,
 	remoteFiles: GitHubFile[],
-	ignorePaths: string[]
+	ignorePaths: string[],
+	extraIgnore?: (path: string) => boolean
 ): Promise<DiffResult> {
 	const result: DiffResult = {
 		toUpload: [],
@@ -46,18 +49,21 @@ export async function computeDiff(
 		unchanged: [],
 	};
 
+	const skip = (path: string): boolean =>
+		shouldIgnore(path, ignorePaths) || (extraIgnore ? extraIgnore(path) : false);
+
 	// 过滤远端文件
 	const remoteMap = new Map<string, GitHubFile>();
 	for (const f of remoteFiles) {
-		if (!shouldIgnore(f.path, ignorePaths)) {
+		if (!skip(f.path)) {
 			remoteMap.set(f.path, f);
 		}
 	}
 
 	// 过滤本地文件
-	const localFiltered: Array<[string, ArrayBuffer]> = [];
+	const localFiltered: Array<[string, ArrayBuffer | null]> = [];
 	for (const [path, buf] of localFiles) {
-		if (!shouldIgnore(path, ignorePaths)) {
+		if (!skip(path)) {
 			localFiltered.push([path, buf]);
 		}
 	}
@@ -70,21 +76,29 @@ export async function computeDiff(
 		}
 	}
 
-	// 只对本地/远端都存在的文件计算 hash，避免无谓的开销
-	const commonFiles = localFiltered.filter(([path]) => remoteMap.has(path));
-	const hashedFiles = await pMap(
-		commonFiles,
-		async ([path, buf]) => {
-			const remote = remoteMap.get(path)!;
-			const localSha = await computeGitBlobSha(buf);
-			return { path, remote, localSha };
-		},
-		HASH_CONCURRENCY
-	);
+	// 双方都存在的文件：对比 git blob sha
+	for (const [path, buf] of localFiltered) {
+		const remote = remoteMap.get(path);
+		if (!remote) continue; // 上面已按"仅本地存在"处理
 
-	for (const item of hashedFiles) {
-		const { path, remote, localSha } = item;
-		if (localSha !== remote.sha) {
+		let localSha = localShas.get(path);
+		if (localSha === undefined && buf) {
+			// git blob sha 前缀包含 size：尺寸不同内容必不同，免掉哈希
+			if (remote.size > 0 && buf.byteLength !== remote.size) {
+				localSha = "";
+			} else {
+				localSha = await computeGitBlobSha(buf);
+			}
+		}
+
+		if (localSha !== undefined && localSha === remote.sha) {
+			result.unchanged.push({
+				path,
+				changeType: "unchanged",
+				remoteSha: remote.sha,
+				remoteMtime: remote.remoteMtime,
+			});
+		} else {
 			result.toUpload.push({
 				path,
 				changeType: "modified",
@@ -94,13 +108,6 @@ export async function computeDiff(
 			result.toDownload.push({
 				path,
 				changeType: "modified",
-				remoteSha: remote.sha,
-				remoteMtime: remote.remoteMtime,
-			});
-		} else {
-			result.unchanged.push({
-				path,
-				changeType: "unchanged",
 				remoteSha: remote.sha,
 				remoteMtime: remote.remoteMtime,
 			});

@@ -1,5 +1,6 @@
 // github.ts — GitHub REST API (no local git required)
 
+import { Notice } from "obsidian";
 import { pMap, arrayBufferToBase64 } from "./utils";
 
 export interface GitHubFile {
@@ -31,6 +32,7 @@ export interface TreeItem {
 const BLOB_CONCURRENCY = 10;   // 创建 blob 并发数
 const DOWNLOAD_CONCURRENCY = 8; // 下载文件并发数
 const MTIME_CONCURRENCY = 6;    // 查询文件修改时间并发（此接口限速更严）
+const REQUEST_TIMEOUT_MS = 30_000; // 单个请求超时
 
 export class GitHubClient {
 	private token: string;
@@ -53,16 +55,36 @@ export class GitHubClient {
 		options: RequestInit = {}
 	): Promise<Response> {
 		const url = path.startsWith("https://") ? path : `${this.baseUrl}${path}`;
-		return fetch(url, {
-			...options,
-			headers: {
-				Authorization: `Bearer ${this.token}`,
-				Accept: "application/vnd.github+json",
-				"X-GitHub-Api-Version": "2022-11-28",
-				"Content-Type": "application/json",
-				...(options.headers || {}),
-			},
-		});
+		const send = (): Promise<Response> => {
+			// 30s 超时,避免单个请求挂死整个同步(旧环境无 AbortSignal.timeout 则跳过)
+			const signal =
+				typeof AbortSignal !== "undefined" &&
+				typeof (AbortSignal as any).timeout === "function"
+					? (AbortSignal as any).timeout(REQUEST_TIMEOUT_MS)
+					: undefined;
+			return fetch(url, {
+				...options,
+				signal,
+				headers: {
+					Authorization: `Bearer ${this.token}`,
+					Accept: "application/vnd.github+json",
+					"X-GitHub-Api-Version": "2022-11-28",
+					"Content-Type": "application/json",
+					...(options.headers || {}),
+				},
+			});
+		};
+		let resp = await send();
+		// 限速：429，或 403 且配额耗尽（GitHub 主限速偶发用 403），按 Retry-After 单次退避重试
+		const rateLimited =
+			resp.status === 429 ||
+			(resp.status === 403 && resp.headers.get("x-ratelimit-remaining") === "0");
+		if (rateLimited) {
+			const retryAfter = Math.min(Number(resp.headers.get("retry-after")) || 2, 30);
+			await new Promise((r) => setTimeout(r, retryAfter * 1000));
+			resp = await send();
+		}
+		return resp;
 	}
 
 	/** 验证 Token 和仓库是否可访问 */
@@ -104,7 +126,11 @@ export class GitHubClient {
 		if (!resp.ok) throw new Error(`获取文件树失败: HTTP ${resp.status}`);
 		const data = await resp.json();
 		if (data.truncated) {
-			console.warn("GitHub Sync: 文件树被截断（超过 100,000 个文件）");
+			console.warn("GitHub Sync: 文件树被截断(超过 100,000 个文件)");
+			new Notice(
+				"⚠️ 仓库文件树过大被 GitHub 截断(超过 10 万个文件),本次同步结果可能不完整",
+				8000
+			);
 		}
 		return data.tree as TreeItem[];
 	}
@@ -185,9 +211,13 @@ export class GitHubClient {
 	/**
 	 * 批量获取指定文件的内容和最近一次提交信息。
 	 * 对每个文件并发请求 /contents/{path}（获取内容）和 /commits（获取提交信息）。
+	 * 超过 maxContentBytes 的文件丢弃内容只保留大小（对比弹窗降级显示，避免占用过多内存）。
 	 * 单个文件失败不中断整体流程。
 	 */
-	async getFilesWithCommits(paths: string[]): Promise<Map<string, FileWithCommitInfo>> {
+	async getFilesWithCommits(
+		paths: string[],
+		maxContentBytes = 10 * 1024 * 1024
+	): Promise<Map<string, FileWithCommitInfo>> {
 		const result = new Map<string, FileWithCommitInfo>();
 
 		await pMap(
@@ -198,9 +228,13 @@ export class GitHubClient {
 						this.downloadFile(path).catch(() => null as ArrayBuffer | null),
 						this.getFileLastCommit(path),
 					]);
+					const content =
+						contentBuf && contentBuf.byteLength > maxContentBytes
+							? null
+							: contentBuf;
 
 					result.set(path, {
-						content: contentBuf,
+						content,
 						commitMessage: commitMsg?.message ?? "",
 						commitDate: commitMsg?.date ?? "",
 						size: contentBuf?.byteLength ?? 0,
@@ -284,8 +318,6 @@ async downloadFiles(
 	return result;
 }
 
-// ... 后面的代码保持不变 ...
-
 	/**
 	 * 批量上传（增量 Git Trees API）
 	 *
@@ -304,7 +336,8 @@ async downloadFiles(
 		files: { path: string; content: ArrayBuffer }[],
 		message: string,
 		currentCommitSha: string | null,
-		currentTreeSha: string | null
+		currentTreeSha: string | null,
+		onProgress?: (done: number, total: number, path: string) => void
 	): Promise<{ newCommitSha: string; newTreeSha: string }> {
 		if (files.length === 0) {
 			return {
@@ -319,7 +352,8 @@ async downloadFiles(
 		if (isEmpty) {
 			let lastCommitSha = "";
 			let lastTreeSha = "";
-			for (const file of files) {
+			for (let i = 0; i < files.length; i++) {
+				const file = files[i];
 				const resp = await this.request(`/contents/${encodePath(file.path)}`, {
 					method: "PUT",
 					body: JSON.stringify({
@@ -337,6 +371,7 @@ async downloadFiles(
 				const data = await resp.json();
 				lastCommitSha = data.commit?.sha ?? "";
 				lastTreeSha = data.commit?.tree?.sha ?? "";
+				onProgress?.(i + 1, files.length, file.path);
 			}
 			return { newCommitSha: lastCommitSha, newTreeSha: lastTreeSha };
 		}
@@ -344,10 +379,13 @@ async downloadFiles(
 		// ── 非空仓库：增量 Git Trees API ──
 
 		// Step 1: 并发创建 blob（受控并发）
+		let blobDone = 0;
 		const treeItems = await pMap(
 			files,
 			async (file) => {
 				const sha = await this.createBlob(file.content);
+				blobDone++;
+				onProgress?.(blobDone, files.length, file.path);
 				return { path: file.path, mode: "100644", type: "blob", sha } as const;
 			},
 			BLOB_CONCURRENCY

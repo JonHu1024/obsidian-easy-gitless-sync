@@ -4,7 +4,7 @@ import { App, TFile, Notice, normalizePath } from "obsidian";
 import { pMap } from "./utils";
 import type { RollbackSnapshot } from "./types";
 
-export const SAVINGS_DIR = ".obsidian/plugins/github-sync-simple/savings";
+export const SAVINGS_DIR = ".obsidian/plugins/easy-gitless-sync/savings";
 const MANIFEST_PATH = `${SAVINGS_DIR}/manifest.json`;
 const MAX_VERSIONS = 2;
 
@@ -47,6 +47,29 @@ export class RollbackManager {
 			try {
 				await this.app.vault.adapter.mkdir(dir);
 			} catch {}
+		}
+	}
+
+	/** 是否为 .obsidian 配置目录下的路径(vault API 不可见,需走 adapter) */
+	private isObsidianPath(path: string): boolean {
+		return path === ".obsidian" || path.startsWith(".obsidian/");
+	}
+
+	/** 确保 adapter 路径下的父目录逐级存在(含 .obsidian) */
+	private async ensureAdapterFolder(path: string): Promise<void> {
+		const parts = path.split("/");
+		let current = "";
+		for (const part of parts) {
+			current = current ? `${current}/${part}` : part;
+			const norm = normalizePath(current);
+			if (norm === ".") continue;
+			try {
+				if (!(await this.app.vault.adapter.exists(norm))) {
+					await this.app.vault.adapter.mkdir(norm);
+				}
+			} catch {
+				// 并发创建时可能冲突,忽略
+			}
 		}
 	}
 
@@ -97,7 +120,8 @@ export class RollbackManager {
 			"_" +
 			String(now.getHours()).padStart(2, "0") +
 			String(now.getMinutes()).padStart(2, "0") +
-			String(now.getSeconds()).padStart(2, "0");
+			String(now.getSeconds()).padStart(2, "0") +
+			String(now.getMilliseconds()).padStart(3, "0");
 		const date = now.toISOString();
 		const dir = this.savingsPath(id);
 
@@ -117,8 +141,8 @@ export class RollbackManager {
 				try {
 					const targetPath = normalizePath(`${dir}/${path}`);
 					const parentDir = normalizePath(targetPath.substring(0, targetPath.lastIndexOf("/")));
-					if (parentDir && parentDir !== dir && !(await this.exists(parentDir))) {
-						await this.app.vault.adapter.mkdir(parentDir);
+					if (parentDir && parentDir !== dir) {
+						await this.ensureAdapterFolder(parentDir);
 					}
 					await this.app.vault.adapter.writeBinary(targetPath, content);
 					filePaths.push(path);
@@ -178,18 +202,27 @@ export class RollbackManager {
 					}
 					const content = await this.app.vault.adapter.readBinary(srcPath);
 
-					// 确保目标父目录在 vault 中存在
-					const targetParent = filePath.substring(0, filePath.lastIndexOf("/"));
-					if (targetParent) {
-						await this.ensureVaultFolder(targetParent);
-					}
-
-					const targetPath = normalizePath(filePath);
-					const existing = this.app.vault.getAbstractFileByPath(targetPath);
-					if (existing instanceof TFile) {
-						await this.app.vault.modifyBinary(existing, content);
+					if (this.isObsidianPath(filePath)) {
+						// .obsidian 下的文件 vault API 不可见,与快照收集一致改走 adapter
+						const targetParent = filePath.substring(0, filePath.lastIndexOf("/"));
+						if (targetParent) {
+							await this.ensureAdapterFolder(targetParent);
+						}
+						await this.app.vault.adapter.writeBinary(normalizePath(filePath), content);
 					} else {
-						await this.app.vault.createBinary(targetPath, content);
+						// 确保目标父目录在 vault 中存在
+						const targetParent = filePath.substring(0, filePath.lastIndexOf("/"));
+						if (targetParent) {
+							await this.ensureVaultFolder(targetParent);
+						}
+
+						const targetPath = normalizePath(filePath);
+						const existing = this.app.vault.getAbstractFileByPath(targetPath);
+						if (existing instanceof TFile) {
+							await this.app.vault.modifyBinary(existing, content);
+						} else {
+							await this.app.vault.createBinary(targetPath, content);
+						}
 					}
 					restored++;
 				} catch (err) {

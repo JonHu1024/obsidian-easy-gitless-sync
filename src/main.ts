@@ -1,8 +1,8 @@
 // main.ts — GitHub Sync 插件入口
 
-import { Notice, Plugin, TFile, normalizePath } from "obsidian";
+import { Notice, Plugin, TFile, TAbstractFile, Menu, normalizePath } from "obsidian";
 import { GitHubClient, GitHubFile } from "./github";
-import { computeDiff, DiffResult, FileDiff, isTextFile, mergeTexts } from "./diff";
+import { computeDiff, computeGitBlobSha, DiffResult, FileDiff, isTextFile, mergeTexts } from "./diff";
 import {
 	ConfirmSyncModal,
 	DiffViewerModal,
@@ -21,9 +21,27 @@ import { CSS } from "./styles";
 import { pMap, strToArrayBuffer, getErrorMessage } from "./utils";
 import { RollbackManager } from "./rollback";
 
+/** sha 缓存条目:mtime+size 未变即复用 sha,跳过读取与哈希 */
+interface HashCacheEntry {
+	mtime: number;
+	size: number;
+	sha: string;
+}
+
+/** 本地 sha 缓存文件(adapter 读写,不进 vault 索引) */
+const HASH_CACHE_PATH = ".obsidian/plugins/easy-gitless-sync/hash-cache.json";
+
+/** syncedPaths 持久化上限(超出裁剪旧记录) */
+const SYNCED_PATHS_CAP = 5000;
+
 interface LocalFileSnapshot {
-	files: Map<string, ArrayBuffer>;
+	/** path -> 内容;未变化的文件为 null(sha 已与远端一致,后续流程用不到内容) */
+	files: Map<string, ArrayBuffer | null>;
 	mtimes: Map<string, number>;
+	/** 本地 git blob sha(读取阶段预计算/缓存) */
+	shas: Map<string, string>;
+	/** 读取失败的文件:本次同步对其"不可见",避免被误判为删除/新增 */
+	failedPaths: string[];
 }
 
 interface SmartSyncPlan {
@@ -44,8 +62,10 @@ export default class GitHubSyncPlugin extends Plugin {
 	// 新增：用于记录未同步文件和防抖保存
 	private unsyncedPaths = new Set<string>();
 	private saveStateTimer: number | null = null;
+	private settingsSaveTimer: number | null = null; // 设置页防抖保存
+	private ignoreListCache: string[] | null = null; // 忽略路径解析缓存
 	private recentlySyncedPaths = new Set<string>();// 冷却池：防止同步写入触发的 modify 被误判
-	private rollbackManager: RollbackManager;
+	private rollbackManager!: RollbackManager;
 
 	async onload() {
 		await this.loadSettings();
@@ -55,7 +75,11 @@ export default class GitHubSyncPlugin extends Plugin {
 		// 首次运行：默认提交信息自动填入设备名
 		if (this.settings.commitMessage === DEFAULT_SETTINGS.commitMessage) {
 			let hostname = "Device";
-			try { hostname = require("os").hostname() || "Device"; } catch {}
+			try {
+				// Electron 渲染进程(nodeIntegration)下可用 require;移动端没有,回退默认名
+				const req = (globalThis as { require?: (id: string) => { hostname(): string } }).require;
+				hostname = req?.("os")?.hostname() || "Device";
+			} catch {}
 			this.settings.commitMessage = `${hostname} sync {date}`;
 			await this.saveSettings();
 		}
@@ -80,7 +104,7 @@ export default class GitHubSyncPlugin extends Plugin {
 		this.updateStatusBar();
 
 		// 左侧边栏图标
-		this.addRibbonIcon("github", "GitHub Sync", () => {
+		this.addRibbonIcon("github", "Easy Gitless Sync", () => {
 			this.openSyncModal();
 		});
 
@@ -132,22 +156,51 @@ export default class GitHubSyncPlugin extends Plugin {
 				if (this.isSyncing) return;
 				if (!(file instanceof TFile)) return;
 				
-				// 先硬编码无视 .obsidian 目录
-				if (file.path.startsWith('.obsidian/') || file.path === '.obsidian') return;
+				// .obsidian 目录：未开启同步、或该子项未被选中同步时忽略
+				if (this.isObsidianPath(file.path)) {
+					if (!this.settings.syncObsidianFolder || !this.isObsidianEntrySelected(file.path)) return;
+				}
 				// 再检查用户配置的忽略路径
 				if (this.shouldIgnoreBySettings(file.path)) return;
-				
+
 				if (this.recentlySyncedPaths.has(file.path)) return;
 
 				this.unsyncedPaths.add(file.path);
 				this.setDirty(true);
 				this.debounceSaveState();
 			};
+			const markDeleted = (file: TAbstractFile) => {
+				if (isBooting) return;
+				if (this.isSyncing) return;
+				if (!(file instanceof TFile)) return;
+				// .obsidian 目录：未开启同步、或该子项未被选中同步时忽略
+				if (this.isObsidianPath(file.path)) {
+					if (!this.settings.syncObsidianFolder || !this.isObsidianEntrySelected(file.path)) return;
+				}
+				if (this.recentlySyncedPaths.has(file.path)) return;
+				if (this.settings.syncedPaths.includes(file.path)) {
+					// 之前同步过的文件被删除 → pending delete
+					this.unsyncedPaths.add(file.path);
+					this.setDirty(true);
+					this.debounceSaveState();
+				} else {
+					// 本地新建又删除 → 移除跟踪
+					if (this.unsyncedPaths.delete(file.path)) {
+						if (this.unsyncedPaths.size === 0) {
+							this.clearDirtyState();
+						} else {
+							this.debounceSaveState();
+						}
+					}
+				}
+			};
 			this.registerEvent(this.app.vault.on("modify", markDirty));
 			this.registerEvent(this.app.vault.on("create", markDirty));
-			this.registerEvent(this.app.vault.on("delete", markDirty));
-			this.registerEvent(this.app.vault.on("rename", (file) => {
-				if (file instanceof TFile) markDirty(file);
+			this.registerEvent(this.app.vault.on("delete", markDeleted));
+			this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+				if (!(file instanceof TFile)) return;
+				this.unsyncedPaths.delete(oldPath); // 旧路径不再跟踪,避免残留
+				markDirty(file);
 			}));
 			this.registerEvent(
 				this.app.workspace.on("file-menu", (menu, file) => {
@@ -155,7 +208,7 @@ export default class GitHubSyncPlugin extends Plugin {
 						menu.addSeparator();
 						menu.addItem((item) => {
 							item
-								.setTitle("GitHub Sync")
+								.setTitle("Easy Gitless Sync")
 								.setIcon("github")
 								.onClick(() => {
 new SyncModeModal(
@@ -173,18 +226,32 @@ new SyncModeModal(
 		// 新增：启动时检查并弹出警告
 		if (this.settings.showUnsyncedWarningOnStartup && this.settings.hasUnsyncedChanges) {
 			setTimeout(() => {
-				new UnsyncedWarningModal(
-					this.app,
-					this.settings.lastUnsyncedPaths || [],
-					() => this.openSyncModal(),
-					this
-				).open();
+				const validPaths = (this.settings.lastUnsyncedPaths || [])
+					.filter(p => !this.shouldIgnoreBySettings(p));
+				if (validPaths.length > 0) {
+					new UnsyncedWarningModal(
+						this.app,
+						validPaths,
+						() => this.openSyncModal(),
+						this
+					).open();
+				}
 			}, 800);//延迟0.8s防止与启动动画冲突
 		}
 	}
 
 	onunload() {
-		if (this.saveStateTimer) window.clearTimeout(this.saveStateTimer);
+		// 有未落盘的防抖状态时立即保存(best-effort:异步写盘不保证在退出前完成)
+		if (this.saveStateTimer) {
+			window.clearTimeout(this.saveStateTimer);
+			this.saveStateTimer = null;
+			void this.flushPendingState();
+		}
+		if (this.settingsSaveTimer) {
+			window.clearTimeout(this.settingsSaveTimer);
+			this.settingsSaveTimer = null;
+			void this.saveSettings().catch(() => {});
+		}
 		this.recentlySyncedPaths.clear();
 		const style = document.getElementById("github-sync-styles");
 		if (style) style.remove();
@@ -193,27 +260,62 @@ new SyncModeModal(
 	// 新增：防抖保存状态到 data.json (5秒内无新修改才写入，避免卡顿)
 	private debounceSaveState() {
 		if (this.saveStateTimer) window.clearTimeout(this.saveStateTimer);
-		this.saveStateTimer = window.setTimeout(async () => {
-			this.settings.hasUnsyncedChanges = this.isDirty;
-			this.settings.lastUnsyncedPaths = Array.from(this.unsyncedPaths);
-			await this.saveSettings().catch(err => console.error("防抖保存状态失败:", err));
+		this.saveStateTimer = window.setTimeout(() => {
+			this.saveStateTimer = null;
+			void this.flushPendingState();
 		}, 5*1000);
+	}
+
+	/** 立即把当前未同步状态写入 data.json(防抖到期或退出时调用) */
+	private async flushPendingState(): Promise<void> {
+		this.settings.hasUnsyncedChanges = this.isDirty;
+		this.settings.lastUnsyncedPaths = Array.from(this.unsyncedPaths);
+		await this.saveSettings().catch(err => console.error("保存未同步状态失败:", err));
+	}
+
+	/** 设置页输入防抖保存,避免每个按键都写一次盘 */
+	debounceSaveSettings(): void {
+		if (this.settingsSaveTimer) window.clearTimeout(this.settingsSaveTimer);
+		this.settingsSaveTimer = window.setTimeout(() => {
+			this.settingsSaveTimer = null;
+			void this.saveSettings().catch(err => console.error("保存设置失败:", err));
+		}, 300);
 	}
 
 	// 新增：彻底清理未同步状态（同步成功后调用）
 	private async clearDirtyState() {
-		try {
-			await this.saveSettings();
-		} catch (err) {
-			console.error("清除脏状态时保存设置失败:", err);
-			return;
-		}
 		this.isDirty = false;
 		this.unsyncedPaths.clear();
 		this.settings.hasUnsyncedChanges = false;
 		this.settings.lastUnsyncedPaths = [];
-		if (this.saveStateTimer) window.clearTimeout(this.saveStateTimer);
+		if (this.saveStateTimer) {
+			window.clearTimeout(this.saveStateTimer);
+			this.saveStateTimer = null;
+		}
+		try {
+			await this.saveSettings();
+		} catch (err) {
+			console.error("清除脏状态时保存设置失败:", err);
+		}
 		this.updateStatusBar();
+	}
+
+	// 同步成功后更新 syncedPaths 并清理脏状态
+	private async finalizeSync(
+		uploadedPaths: string[],
+		downloadedPaths: string[],
+		deletedPaths: string[]
+	) {
+		const set = new Set(this.settings.syncedPaths);
+		for (const p of uploadedPaths) if (p) set.add(p);
+		for (const p of downloadedPaths) if (p) set.add(p);
+		for (const p of deletedPaths) if (p) set.delete(p);
+		// 上限保护：syncedPaths 只用于"未同步提醒"的删除判定，不影响 diff 正确性，
+		// 超出时保留最新记录，防止 data.json 无限膨胀
+		const list = Array.from(set);
+		this.settings.syncedPaths =
+			list.length > SYNCED_PATHS_CAP ? list.slice(-SYNCED_PATHS_CAP) : list;
+		await this.clearDirtyState();
 	}
 
 	// 对比发现内容一致的路径，从未同步列表中移除
@@ -247,20 +349,32 @@ new SyncModeModal(
 			this.statusBarEl.setText("⚠️GitHub未同步");
 			this.statusBarEl.style.color = "var(--text-warning, #e6922a)";
 			this.statusBarEl.style.cursor = "pointer";
-			this.statusBarEl.title = "点击对比未同步文件";
-			this.statusBarEl.onclick = () => {
-				if (this.unsyncedPaths.size > 0) {
-					new DiffViewerModal(
-						this.app,
-						Array.from(this.unsyncedPaths),
-						this,
-						() => this.openSyncModal(),
-						true,
-						(paths) => this.onCompareIdentical(paths)
-					).open();
-				} else {
-					this.openSyncModal();
-				}
+			this.statusBarEl.title = "为强迫症用户设计。如有新的文件修改，仍将切换为未同步的状态";
+			this.statusBarEl.onclick = (event: MouseEvent) => {
+				const menu = new Menu();
+				menu.addItem((item) =>
+					item.setTitle("对比未同步文件").onClick(() => {
+						if (this.unsyncedPaths.size > 0) {
+							new DiffViewerModal(
+								this.app,
+								Array.from(this.unsyncedPaths),
+								this,
+								() => this.openSyncModal(),
+								true,
+								(paths) => this.onCompareIdentical(paths)
+							).open();
+						} else {
+							this.openSyncModal();
+						}
+					})
+				);
+				menu.addItem((item) =>
+					item.setTitle("本次状态设为已同步").onClick(async () => {
+						await this.clearDirtyState();
+						new Notice("✅ 已标记为已同步状态");
+					})
+				);
+				menu.showAtMouseEvent(event);
 			};
 		} else {
 			this.statusBarEl.setText("✅GitHub已同步");
@@ -287,6 +401,7 @@ new SyncModeModal(
 		const data = { ...this.settings };
 		// 加密存储 token（原文 → base64）
 		if (data.token) data.token = btoa(data.token);
+		this.ignoreListCache = null; // 忽略路径可能已变化
 		await this.saveData(data);
 	}
 
@@ -303,12 +418,22 @@ new SyncModeModal(
 			paths,
 			async (path) => {
 				try {
-					const file = this.app.vault.getAbstractFileByPath(
-						normalizePath(path)
-					);
-					if (file instanceof TFile) {
-						const content = await this.app.vault.readBinary(file);
-						result.set(path, content);
+					if (this.isObsidianPath(path)) {
+						const normalPath = normalizePath(path);
+						if (await this.app.vault.adapter.exists(normalPath)) {
+							result.set(
+								path,
+								await this.app.vault.adapter.readBinary(normalPath)
+							);
+						}
+					} else {
+						const file = this.app.vault.getAbstractFileByPath(
+							normalizePath(path)
+						);
+						if (file instanceof TFile) {
+							const content = await this.app.vault.readBinary(file);
+							result.set(path, content);
+						}
 					}
 				} catch {}
 			},
@@ -343,25 +468,51 @@ new SyncModeModal(
 		progress.open();
 
 		try {
-			const { token, repository, branch, ignorePaths } = this.settings;
-			const ignore = ignorePaths
-				.split("\n")
-				.map((s) => s.trim())
-				.filter(Boolean);
+			const { token, repository, branch } = this.settings;
+			const ignore = this.buildIgnoreList();
 
 			const client = new GitHubClient(token, repository, branch);
 
-			// 1. 读取本地文件
-			progress.setMessage(targetPath ? `读取 ${targetPath}...` : "读取本地 Vault 文件...");
-			const local = await this.readLocalFiles(ignore);
-
-			// 2. 读取远端文件列表
+			// 1. 先获取远端文件列表:本地读取可借助 sha 缓存跳过未变化文件
 			progress.setMessage("获取 GitHub 文件列表...");
+			progress.setProgress(-1); // 总数未知,显示流动条
 			const remote = await client.listAllFiles();
+
+			// 2. 读取本地文件(未变化的文件不读内容)
+			progress.setMessage(targetPath ? `读取 ${targetPath}...` : "读取本地 Vault 文件...");
+			progress.setProgress(0);
+			const local = await this.readLocalFiles(ignore, remote.files, (done, total) => {
+				// 节流:每 25 个文件或最后一个时才刷新 UI
+				if (done === total || done % 25 === 0) {
+					progress.setMessage(`读取本地文件 ${done}/${total}...`);
+					progress.setProgress((done / Math.max(total, 1)) * 95);
+				}
+			});
 
 			// 3. 计算差异
 			progress.setMessage("计算差异...");
-			let diff = await computeDiff(local.files, remote.files, ignore);
+			progress.setProgress(97);
+			// .obsidian 中未被选中同步的子项对两端同时"不可见",
+			// 否则远端存在但本地未选中的文件会被当作差异,Push 时被删除
+			const extraIgnore = (p: string) => this.isObsidianPath(p) && !this.isObsidianEntrySelected(p);
+			let diff = await computeDiff(local.files, local.shas, remote.files, ignore, extraIgnore);
+
+			// 读取失败的文件本次"不可见":既不上传/删除,也不下载/覆盖,
+			// 否则瞬时读取失败(如文件被占用)会被误判成"本地已删除"而误删远端
+			if (local.failedPaths.length > 0) {
+				const failed = new Set(local.failedPaths);
+				diff = {
+					toUpload: diff.toUpload.filter((f) => !failed.has(f.path)),
+					toDelete: diff.toDelete.filter((f) => !failed.has(f.path)),
+					toDownload: diff.toDownload.filter((f) => !failed.has(f.path)),
+					toRemove: diff.toRemove.filter((f) => !failed.has(f.path)),
+					unchanged: diff.unchanged,
+				};
+				new Notice(
+					`⚠️ ${local.failedPaths.length} 个文件读取失败，本次同步已跳过：${this.formatFailedPaths(local.failedPaths)}`,
+					8000
+				);
+			}
 
 			if (targetPath) {
 				diff = {
@@ -377,9 +528,11 @@ new SyncModeModal(
 			let smartPlan: SmartSyncPlan | null = null;
 			if (mode === "time") {
 				progress.setMessage("分析修改时间并生成同步计划...");
+				progress.setProgress(-1); // 需要按文件查询远端,总数即文件数但耗时未知
 				smartPlan = await this.buildTimeSyncPlan(client, local, remote.files, diff);
 			} else if (mode === "merge") {
 				progress.setMessage("分析冲突并生成合并计划...");
+				progress.setProgress(-1);
 				smartPlan = await this.buildMergePlan(client, local, remote.files, diff);
 			}
 
@@ -396,6 +549,13 @@ new SyncModeModal(
 			if (mode === "push") {
 				const toProcess = diff.toUpload;
 				const toRemove = diff.toDelete;
+				if (toProcess.length === 0 && toRemove.length === 0) {
+					// 单文件同步时只清理该文件的跟踪,避免误清其他未同步记录
+					if (targetPath) this.onCompareIdentical([targetPath]);
+					else await this.clearDirtyState();
+					new Notice(`✅ 已是最新，无需同步`);
+					return;
+				}
 				new ConfirmSyncModal(this.app, {
 					mode: "push",
 					toProcess,
@@ -415,6 +575,13 @@ new SyncModeModal(
 			} else if (mode === "pull") {
 				const toProcess = diff.toDownload;
 				const toRemove = diff.toRemove;
+				if (toProcess.length === 0 && toRemove.length === 0) {
+					// 单文件同步时只清理该文件的跟踪,避免误清其他未同步记录
+					if (targetPath) this.onCompareIdentical([targetPath]);
+					else await this.clearDirtyState();
+					new Notice(`✅ 已是最新，无需同步`);
+					return;
+				}
 				new ConfirmSyncModal(this.app, {
 					mode: "pull",
 					toProcess,
@@ -426,6 +593,13 @@ new SyncModeModal(
 				}).open();
 			} else if (mode === "time") {
 				if (!smartPlan) throw new Error("按时间同步计划生成失败");
+				if (smartPlan.previewItems.length === 0) {
+					// 单文件同步时只清理该文件的跟踪,避免误清其他未同步记录
+					if (targetPath) this.onCompareIdentical([targetPath]);
+					else await this.clearDirtyState();
+					new Notice(`✅ 已是最新，无需同步`);
+					return;
+				}
 				new ConfirmSyncModal(this.app, {
 					mode: "time",
 					toProcess: smartPlan.previewItems,
@@ -449,6 +623,13 @@ new SyncModeModal(
 				}).open();
 			} else {
 				if (!smartPlan) throw new Error("智能合并计划生成失败");
+				if (smartPlan.previewItems.length === 0) {
+					// 单文件同步时只清理该文件的跟踪,避免误清其他未同步记录
+					if (targetPath) this.onCompareIdentical([targetPath]);
+					else await this.clearDirtyState();
+					new Notice(`✅ 已是最新，无需同步`);
+					return;
+				}
 				new ConfirmSyncModal(this.app, {
 					mode: "merge",
 					toProcess: smartPlan.previewItems,
@@ -650,6 +831,7 @@ new SyncModeModal(
 		return {
 			uploads,
 			downloads,
+			deletions: [],
 			merges,
 			previewItems,
 			unchanged: diff.unchanged.length,
@@ -662,7 +844,7 @@ new SyncModeModal(
 
 	private async executePush(
 		client: GitHubClient,
-		localFiles: Map<string, ArrayBuffer>,
+		localFiles: Map<string, ArrayBuffer | null>,
 		currentCommitSha: string | null,
 		currentTreeSha: string | null,
 		toUpload: FileDiff[],
@@ -684,6 +866,7 @@ new SyncModeModal(
 				: Promise.resolve();
 
 			const message = this.buildCommitMessage();
+			let uploadedPaths: string[] = [];
 
 			if (toUpload.length > 0) {
 				const filesToUpload = toUpload
@@ -694,18 +877,25 @@ new SyncModeModal(
 					})
 					.filter(Boolean) as { path: string; content: ArrayBuffer }[];
 
-				const uploadResult = await client.batchUpload(
-					filesToUpload,
-					message,
-					currentCommitSha,
-					currentTreeSha
-				);
+				if (filesToUpload.length > 0) {
+					const uploadResult = await client.batchUpload(
+						filesToUpload,
+						message,
+						currentCommitSha,
+						currentTreeSha,
+						(done, total, path) =>
+							this.setNoticeText(startNotice, `⬆️ 上传中 ${done}/${total}：${path}`)
+					);
 
-				currentCommitSha = uploadResult.newCommitSha;
-				currentTreeSha = uploadResult.newTreeSha;
+					currentCommitSha = uploadResult.newCommitSha;
+					currentTreeSha = uploadResult.newTreeSha;
+					// 以实际上传的文件为准(读取失败的会被跳过)
+					uploadedPaths = filesToUpload.map((f) => f.path);
+				}
 			}
 
 			if (toDelete.length > 0 && currentCommitSha && currentTreeSha) {
+				this.setNoticeText(startNotice, `🗑️ 正在从远端删除 ${toDelete.length} 个文件...`);
 				await client.batchDelete(
 					toDelete.map((f) => ({ path: f.path })),
 					message,
@@ -717,8 +907,12 @@ new SyncModeModal(
 			await snapshotPromise;
 
 			startNotice.hide();
-			new Notice(`✅ Push 完成：上传 ${toUpload.length}，删除 ${toDelete.length}`);
-			await this.clearDirtyState();
+			new Notice(`✅ Push 完成：上传 ${uploadedPaths.length}，删除 ${toDelete.length}`);
+			await this.finalizeSync(
+				uploadedPaths,
+				[],
+				toDelete.map(f => f.path)
+			);
 		} catch (err) {
 			startNotice.hide();
 			console.error("Push error:", err);
@@ -756,12 +950,16 @@ new SyncModeModal(
 			let downloaded = new Map<string, ArrayBuffer>();
 			if (toDownload.length > 0) {
 				const filesToDownload = toDownload.map((f) => ({ path: f.path, sha: f.remoteSha }));
-				downloaded = await client.downloadFiles(filesToDownload);
+				downloaded = await client.downloadFiles(filesToDownload, (done, total, path) =>
+					this.setNoticeText(startNotice, `⬇️ 下载中 ${done}/${total}：${path}`)
+				);
 			}
 
 			// 等待快照完成后再写本地
 			await snapshotPromise;
 
+			// 只把真正拿到内容的文件算作成功
+			const writtenPaths = toDownload.filter(f => downloaded.get(f.path)).map(f => f.path);
 			if (toDownload.length > 0) {
 				for (const { path } of toDownload) {
 					const content = downloaded.get(path);
@@ -775,10 +973,21 @@ new SyncModeModal(
 			}
 
 			startNotice.hide();
+			const failedDownloads = toDownload.filter(f => !downloaded.get(f.path)).map(f => f.path);
+			if (failedDownloads.length > 0) {
+				new Notice(
+					`⚠️ ${failedDownloads.length} 个文件下载失败，未写入：${this.formatFailedPaths(failedDownloads)}`,
+					8000
+				);
+			}
 			new Notice(
-				`✅ Pull 完成：下载 ${toDownload.length}，删除 ${toRemove.length}`
+				`✅ Pull 完成：下载 ${writtenPaths.length}/${toDownload.length}，删除 ${toRemove.length}`
 			);
-			await this.clearDirtyState();
+			await this.finalizeSync(
+				[],
+				writtenPaths,
+				toRemove.map(f => f.path)
+			);
 		} catch (err) {
 			startNotice.hide();
 			console.error("Pull error:", err);
@@ -797,7 +1006,7 @@ new SyncModeModal(
 
 	private async executeSmartSync(
 		client: GitHubClient,
-		localFiles: Map<string, ArrayBuffer>,
+		localFiles: Map<string, ArrayBuffer | null>,
 		currentCommitSha: string | null,
 		currentTreeSha: string | null,
 		uploads: FileDiff[],
@@ -824,28 +1033,38 @@ new SyncModeModal(
 
 			const message = this.buildCommitMessage();
 
-			const uploadPromise = uploads.length > 0
+			// 内容缺失的文件跳过上传(在本地快照里就是 null)
+			const filesToUpload = uploads
+				.map((f) => {
+					const content = localFiles.get(f.path);
+					if (!content) return null;
+					return { path: f.path, content };
+				})
+				.filter(Boolean) as { path: string; content: ArrayBuffer }[];
+
+			const uploadPromise = filesToUpload.length > 0
 				? client.batchUpload(
-					uploads
-						.map((f) => {
-							const content = localFiles.get(f.path);
-							if (!content) return null;
-							return { path: f.path, content };
-						})
-						.filter(Boolean) as { path: string; content: ArrayBuffer }[],
+					filesToUpload,
 					message,
 					currentCommitSha,
-					currentTreeSha
+					currentTreeSha,
+					(done, total, path) =>
+						this.setNoticeText(startNotice, `⬆️ 上传中 ${done}/${total}：${path}`)
 				  ).then(r => ({ commitSha: r.newCommitSha, treeSha: r.newTreeSha }))
 				: Promise.resolve(null);
 
 			const downloadPromise = downloads.length > 0
 				? client.downloadFiles(
-					downloads.map((f) => ({ path: f.path, sha: f.remoteSha }))
+					downloads.map((f) => ({ path: f.path, sha: f.remoteSha })),
+					(done, total, path) =>
+						this.setNoticeText(startNotice, `⬇️ 下载中 ${done}/${total}：${path}`)
 				  )
 				: Promise.resolve(new Map<string, ArrayBuffer>());
 
 			const [uploadResult, downloaded] = await Promise.all([uploadPromise, downloadPromise]);
+			// 以实际成功为准:上传了才算上传,拿到内容并写入才算下载
+			const uploadedPaths = uploadResult ? filesToUpload.map((f) => f.path) : [];
+			const writtenPaths = downloads.filter(f => downloaded.get(f.path)).map(f => f.path);
 
 			// 等待快照完成后再写本地
 			await snapshotPromise;
@@ -872,10 +1091,28 @@ new SyncModeModal(
 			}
 
 			startNotice.hide();
+			const failedUploads = uploads.filter(f => !localFiles.get(f.path)).map(f => f.path);
+			const failedDownloads = downloads.filter(f => !downloaded.get(f.path)).map(f => f.path);
+			if (failedUploads.length > 0) {
+				new Notice(
+					`⚠️ ${failedUploads.length} 个文件内容不可用，未上传：${this.formatFailedPaths(failedUploads)}`,
+					8000
+				);
+			}
+			if (failedDownloads.length > 0) {
+				new Notice(
+					`⚠️ ${failedDownloads.length} 个文件下载失败，未写入：${this.formatFailedPaths(failedDownloads)}`,
+					8000
+				);
+			}
 			new Notice(
-				`✅ 智能同步完成：上传 ${uploads.length}，下载 ${downloads.length}，删除 ${toDeleteFromRemote.length}`
+				`✅ 智能同步完成：上传 ${uploadedPaths.length}/${uploads.length}，下载 ${writtenPaths.length}/${downloads.length}，删除 ${toDeleteFromRemote.length}`
 			);
-			await this.clearDirtyState();
+			await this.finalizeSync(
+				uploadedPaths,
+				writtenPaths,
+				toDeleteFromRemote.map(f => f.path)
+			);
 		} catch (err) {
 			startNotice.hide();
 			console.error("Smart sync error:", err);
@@ -894,7 +1131,7 @@ new SyncModeModal(
 
 	private async executeMergeSync(
 		client: GitHubClient,
-		localFiles: Map<string, ArrayBuffer>,
+		localFiles: Map<string, ArrayBuffer | null>,
 		currentCommitSha: string | null,
 		currentTreeSha: string | null,
 		uploads: FileDiff[],
@@ -923,16 +1160,21 @@ new SyncModeModal(
 			const message = this.buildCommitMessage();
 
 			// 并行获取 merge 远程内容 + 下载文件
+			let mergeDone = 0;
 			const mergeDownloadsPromise = Promise.all(
 				merges.map(async (item) => {
 					const rc = await client.downloadFile(item.path, item.remoteSha).catch(() => null);
+					mergeDone++;
+					this.setNoticeText(startNotice, `🔀 拉取冲突文件 ${mergeDone}/${merges.length}：${item.path}`);
 					return { item, remoteContent: rc };
 				})
 			);
 
 			const downloadPromise = downloads.length > 0
 				? client.downloadFiles(
-					downloads.map((f) => ({ path: f.path, sha: f.remoteSha }))
+					downloads.map((f) => ({ path: f.path, sha: f.remoteSha })),
+					(done, total, path) =>
+						this.setNoticeText(startNotice, `⬇️ 下载中 ${done}/${total}：${path}`)
 				  )
 				: Promise.resolve(new Map<string, ArrayBuffer>());
 
@@ -940,6 +1182,7 @@ new SyncModeModal(
 			await snapshotPromise;
 
 			// Phase 2：合并写入（顺序），然后上传
+			const mergedPaths: string[] = [];
 			for (const { item, remoteContent } of mergeDownloads) {
 				if (!remoteContent) continue;
 				const localBuf = localFiles.get(item.path);
@@ -950,8 +1193,10 @@ new SyncModeModal(
 				const mergedBuf = strToArrayBuffer(mergedText);
 				await this.writeLocalFile(item.path, mergedBuf);
 				localFiles.set(item.path, mergedBuf);
+				mergedPaths.push(item.path);
 			}
 
+			let uploadedPaths: string[] = [];
 			if (uploads.length > 0 || merges.length > 0) {
 				const filesToUpload = [...uploads, ...merges]
 					.map((f) => {
@@ -963,12 +1208,16 @@ new SyncModeModal(
 
 				if (filesToUpload.length > 0) {
 					await client.batchUpload(
-						filesToUpload, message, currentCommitSha, currentTreeSha
+						filesToUpload, message, currentCommitSha, currentTreeSha,
+						(done, total, path) =>
+							this.setNoticeText(startNotice, `⬆️ 上传中 ${done}/${total}：${path}`)
 					);
+					uploadedPaths = filesToUpload.map((f) => f.path);
 				}
 			}
 
 			// Phase 3：下载写入本地
+			const writtenPaths = downloads.filter(f => downloaded.get(f.path)).map(f => f.path);
 			for (const f of downloads) {
 				const content = downloaded.get(f.path);
 				if (!content) continue;
@@ -976,8 +1225,29 @@ new SyncModeModal(
 			}
 
 			startNotice.hide();
-			new Notice(`✅ 合并同步完成：上传 ${uploads.length}，下载 ${downloads.length}，合并 ${merges.length}`);
-			await this.clearDirtyState();
+			const mergedSet = new Set(mergedPaths);
+			const failedMerges = merges.filter(f => !mergedSet.has(f.path)).map(f => f.path);
+			if (failedMerges.length > 0) {
+				new Notice(
+					`⚠️ ${failedMerges.length} 个文件无法合并（远端内容不可用），已按原样保留：${this.formatFailedPaths(failedMerges)}`,
+					8000
+				);
+			}
+			const failedDownloads = downloads.filter(f => !downloaded.get(f.path)).map(f => f.path);
+			if (failedDownloads.length > 0) {
+				new Notice(
+					`⚠️ ${failedDownloads.length} 个文件下载失败，未写入：${this.formatFailedPaths(failedDownloads)}`,
+					8000
+				);
+			}
+			new Notice(
+				`✅ 合并同步完成：上传 ${uploadedPaths.length}/${uploads.length + merges.length}，下载 ${writtenPaths.length}/${downloads.length}，合并 ${mergedPaths.length}/${merges.length}`
+			);
+			await this.finalizeSync(
+				uploadedPaths,
+				writtenPaths,
+				[]
+			);
 		} catch (err) {
 			startNotice.hide();
 			console.error("Merge sync error:", err);
@@ -994,37 +1264,141 @@ new SyncModeModal(
 	// 本地文件操作
 	// ──────────────────────────────────────────────
 
-	private async readLocalFiles(ignore: string[]): Promise<LocalFileSnapshot> {
+	private async readLocalFiles(
+		ignore: string[],
+		remoteFiles: GitHubFile[],
+		onProgress?: (done: number, total: number) => void
+	): Promise<LocalFileSnapshot> {
+		const remoteMap = new Map(remoteFiles.map((f) => [f.path, f] as const));
+		const cache = await this.loadHashCache();
+		const nextCache: Record<string, HashCacheEntry> = {};
+
+		const result: LocalFileSnapshot = {
+			files: new Map<string, ArrayBuffer | null>(),
+			mtimes: new Map<string, number>(),
+			shas: new Map<string, string>(),
+			failedPaths: [],
+		};
+
+		// 单文件统一处理:mtime+size 命中缓存则复用 sha;
+		// sha 与远端一致时连内容都不读(后续流程用不到未变化文件的内容)
+		const processOne = async (
+			path: string,
+			mtime: number,
+			size: number,
+			read: () => Promise<ArrayBuffer>
+		): Promise<void> => {
+			const cached = cache[path];
+			if (cached && cached.mtime === mtime && cached.size === size) {
+				nextCache[path] = cached;
+				result.mtimes.set(path, mtime);
+				result.shas.set(path, cached.sha);
+				const remote = remoteMap.get(path);
+				if (remote && remote.sha === cached.sha) {
+					result.files.set(path, null);
+				} else {
+					result.files.set(path, await read());
+				}
+				return;
+			}
+			const content = await read();
+			const sha = await computeGitBlobSha(content);
+			nextCache[path] = { mtime, size, sha };
+			result.mtimes.set(path, mtime);
+			result.shas.set(path, sha);
+			result.files.set(path, content);
+		};
+
 		const files = this.app.vault.getFiles();
 		const filtered = files.filter((file) => !this.shouldIgnoreLocal(file.path, ignore));
 
-		const items = await pMap(
+		// 先列出 .obsidian 待同步文件,让进度回调从一开始就能拿到完整总数
+		let obsidianPaths: string[] = [];
+		if (this.settings.syncObsidianFolder) {
+			obsidianPaths = (await this.listAdapterPaths(".obsidian"))
+				.filter((path) => this.isObsidianEntrySelected(path))
+				.filter((path) => !this.shouldIgnoreLocal(path, ignore));
+		}
+
+		const total = filtered.length + obsidianPaths.length;
+		let done = 0;
+		const tick = () => {
+			done++;
+			onProgress?.(done, total);
+		};
+
+		await pMap(
 			filtered,
 			async (file) => {
 				try {
-					const content = await this.app.vault.readBinary(file);
 					const mtime = file.stat?.mtime ?? file.stat?.ctime ?? 0;
-					return { path: file.path, content, mtime };
+					await processOne(
+						file.path,
+						mtime,
+						file.stat?.size ?? 0,
+						() => this.app.vault.readBinary(file)
+					);
 				} catch (err) {
 					console.warn(`读取本地文件失败: ${file.path}`, err);
-					return null;
+					result.failedPaths.push(file.path);
 				}
+				tick();
 			},
 			8
 		);
 
-		const result: LocalFileSnapshot = {
-			files: new Map<string, ArrayBuffer>(),
-			mtimes: new Map<string, number>(),
-		};
-
-		for (const item of items) {
-			if (!item) continue;
-			result.files.set(item.path, item.content);
-			result.mtimes.set(item.path, item.mtime);
+		// vault API 不会返回 .obsidian 目录下的文件，需通过 adapter 读取
+		if (obsidianPaths.length > 0) {
+			await pMap(
+				obsidianPaths,
+				async (path) => {
+					try {
+						const normalPath = normalizePath(path);
+						const stat = await this.app.vault.adapter.stat(normalPath);
+						// adapter.stat 与 TFile.stat 同为 Stat 接口，毫秒时间戳
+						await processOne(
+							path,
+							stat?.mtime ?? 0,
+							stat?.size ?? 0,
+							() => this.app.vault.adapter.readBinary(normalPath)
+						);
+					} catch (err) {
+						console.warn(`读取 .obsidian 文件失败: ${path}`, err);
+						result.failedPaths.push(path);
+					}
+					tick();
+				},
+				8
+			);
 		}
 
+		await this.saveHashCache(nextCache);
 		return result;
+	}
+
+	/** 读取本地 sha 缓存(path -> {mtime,size,sha}),缺失/损坏时返回空 */
+	private async loadHashCache(): Promise<Record<string, HashCacheEntry>> {
+		try {
+			const p = normalizePath(HASH_CACHE_PATH);
+			if (await this.app.vault.adapter.exists(p)) {
+				const data = JSON.parse(await this.app.vault.adapter.read(p));
+				if (data && typeof data === "object" && data.entries) {
+					return data.entries as Record<string, HashCacheEntry>;
+				}
+			}
+		} catch {}
+		return {};
+	}
+
+	/** 持久化 sha 缓存(仅保留本次扫描到的路径,已删除文件自动清理) */
+	private async saveHashCache(entries: Record<string, HashCacheEntry>): Promise<void> {
+		try {
+			const p = normalizePath(HASH_CACHE_PATH);
+			await this.ensureAdapterFolder(p.substring(0, p.lastIndexOf("/")));
+			await this.app.vault.adapter.write(p, JSON.stringify({ version: 1, entries }));
+		} catch (err) {
+			console.warn("写入 sha 缓存失败:", err);
+		}
 	}
 
 	private async writeLocalFile(
@@ -1032,6 +1406,11 @@ new SyncModeModal(
 		content: ArrayBuffer
 	): Promise<void> {
 		const normalPath = normalizePath(path);
+		if (this.isObsidianPath(normalPath)) {
+			await this.writeAdapterFile(normalPath, content);
+			return;
+		}
+
 		// 确保父目录存在
 		const dir = normalPath.substring(0, normalPath.lastIndexOf("/"));
 		if (dir) {
@@ -1048,6 +1427,14 @@ new SyncModeModal(
 
 	private async deleteLocalFile(path: string): Promise<void> {
 		const normalPath = normalizePath(path);
+		if (this.isObsidianPath(normalPath)) {
+			try {
+				await this.app.vault.adapter.remove(normalPath);
+			} catch (err) {
+				console.warn(`删除 .obsidian 文件失败: ${normalPath}`, err);
+			}
+			return;
+		}
 		const file = this.app.vault.getAbstractFileByPath(normalPath);
 		if (file) {
 			await this.app.vault.trash(file, true);
@@ -1071,6 +1458,75 @@ new SyncModeModal(
 		}
 	}
 
+	/** 是否为 .obsidian 配置目录下的路径（vault API 不可见，需走 adapter） */
+	private isObsidianPath(path: string): boolean {
+		return path === ".obsidian" || path.startsWith(".obsidian/");
+	}
+
+	/** .obsidian 下的条目是否被选中同步；未选择 = 全部同步。
+	 *  命中规则：自身或任一祖先被显式选中（如选中 plugins 则其下全部内容同步）。 */
+	private isObsidianEntrySelected(path: string): boolean {
+		const sel = this.settings.obsidianSyncSelection;
+		if (!sel || sel.length === 0) return true;
+		if (!this.isObsidianPath(path)) return true;
+		const rest = path.slice(".obsidian/".length);
+		if (!rest) return false;
+		if (sel.includes(rest)) return true;
+		return sel.some((s) => rest.startsWith(s + "/"));
+	}
+
+	/** 递归列出目录下所有文件路径（含 .obsidian） */
+	private async listAdapterPaths(dir: string): Promise<string[]> {
+		const result: string[] = [];
+		let listing;
+		try {
+			listing = await this.app.vault.adapter.list(normalizePath(dir));
+		} catch {
+			return result;
+		}
+		for (const file of listing.files) {
+			result.push(file);
+		}
+		for (const folder of listing.folders) {
+			result.push(...(await this.listAdapterPaths(folder)));
+		}
+		return result;
+	}
+
+	/** 确保 adapter 路径下的父目录（含 .obsidian）存在 */
+	private async ensureAdapterFolder(path: string): Promise<void> {
+		const parts = path.split("/");
+		let current = "";
+		for (const part of parts) {
+			current = current ? `${current}/${part}` : part;
+			const norm = normalizePath(current);
+			if (norm === ".") {
+				continue;
+			}
+			try {
+				if (!(await this.app.vault.adapter.exists(norm))) {
+					await this.app.vault.adapter.mkdir(norm);
+				}
+			} catch (err) {
+				// 并发创建时可能冲突，忽略
+			}
+		}
+	}
+
+	private async writeAdapterFile(path: string, content: ArrayBuffer): Promise<void> {
+		const normalPath = normalizePath(path);
+		const dir = normalPath.substring(0, normalPath.lastIndexOf("/"));
+		if (dir) {
+			await this.ensureAdapterFolder(dir);
+		}
+		try {
+			await this.app.vault.adapter.writeBinary(normalPath, content);
+		} catch (err) {
+			console.warn(`写入 .obsidian 文件失败: ${normalPath}`, err);
+			throw err;
+		}
+	}
+
 	// ──────────────────────────────────────────────
 	// 辅助函数
 	// ──────────────────────────────────────────────
@@ -1083,7 +1539,7 @@ new SyncModeModal(
 			);
 			// 打开设置
 			(this.app as any).setting?.open?.();
-			(this.app as any).setting?.openTabById?.("github-sync");
+			(this.app as any).setting?.openTabById?.(this.manifest.id);
 			return false;
 		}
 		return true;
@@ -1099,16 +1555,36 @@ new SyncModeModal(
 	}
 
 	private shouldIgnoreBySettings(path: string): boolean {
+		return this.shouldIgnoreLocal(path, this.buildIgnoreList());
+	}
+
+	// 构建忽略路径列表（不含 .obsidian 时自动追加，由设置控制；解析结果缓存，设置保存时失效）
+	private buildIgnoreList(): string[] {
+		if (this.ignoreListCache) return this.ignoreListCache;
 		const ignores = this.settings.ignorePaths
 			.split("\n")
 			.map(s => s.trim())
 			.filter(Boolean);
-		return this.shouldIgnoreLocal(path, ignores);
+		if (!this.settings.syncObsidianFolder) ignores.push(".obsidian");
+		this.ignoreListCache = ignores;
+		return ignores;
 	}
 
 	private buildCommitMessage(): string {
 		const now = new Date().toISOString().replace("T", " ").substring(0, 19);
 		return this.settings.commitMessage.replace("{date}", now);
+	}
+
+	/** 更新常驻通知的文本（执行阶段的实时进度；messageEl 于 1.8.7 引入，旧版回退 noticeEl） */
+	private setNoticeText(notice: Notice, text: string): void {
+		const el = (notice as unknown as { messageEl?: HTMLElement }).messageEl ?? notice.noticeEl;
+		el.setText(text);
+	}
+
+	/** 生成失败文件提示文本（最多列 3 个，其余以数量概括） */
+	private formatFailedPaths(paths: string[]): string {
+		const shown = paths.slice(0, 3).join("、");
+		return paths.length > 3 ? `${shown} 等 ${paths.length} 个` : shown;
 	}
 
 	// ──────────────────────────────────────────────

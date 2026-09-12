@@ -1,6 +1,6 @@
 // modals.ts — 同步确认对话框
 
-import { App, Modal, Setting, TFile, normalizePath } from "obsidian";
+import { App, Modal, Notice, Setting, TFile, normalizePath } from "obsidian";
 import { FileDiff, isTextFile } from "./diff";
 import type { RollbackSnapshot } from "./types";
 import { MergeView } from "@codemirror/merge";
@@ -19,6 +19,28 @@ function onlyTrailingBlankLinesDiffer(a: string, b: string): boolean {
 	const norm = (s: string) => s.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 	const strip = (s: string) => norm(s).replace(/\n+$/, "");
 	return strip(a) === strip(b);
+}
+
+/** 时间戳 → "MM-DD HH:mm" 本地时区短格式（供时间判定依据显示） */
+function fmtTime(t: number): string {
+	const d = new Date(t);
+	const p = (n: number) => String(n).padStart(2, "0");
+	return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** .obsidian 子项选择器中的敏感条目提示 */
+const OBSIDIAN_ENTRY_HINTS: Record<string, string> = {
+	"plugins": "可展开按插件细分勾选；各插件的 data.json 可能含敏感配置",
+	"workspace.json": "窗口布局缓存，通常无需同步",
+	"workspace-mobile.json": "移动端布局缓存，通常无需同步",
+};
+
+/** 树状选择器的节点描述(rel 相对 .obsidian 根,如 "plugins/dataview") */
+interface PickerNode {
+	rel: string;
+	name: string;
+	isFolder: boolean;
+	depth: number;
 }
 
 export class SyncModeModal extends Modal {
@@ -48,25 +70,25 @@ export class SyncModeModal extends Modal {
 
 		const btnContainer = contentEl.createDiv("github-sync-mode-buttons");
 
-		const pushBtn = btnContainer.createEl("button", { cls: "github-sync-mode-btn" });
+		const pushBtn = btnContainer.createEl("button", { cls: "github-sync-mode-btn mode-push" });
 		pushBtn.createEl("div", { text: "⬆️", cls: "github-sync-mode-icon" });
 		pushBtn.createEl("div", { text: "Push", cls: "github-sync-mode-label" });
 		pushBtn.createEl("div", { text: "将本地更改上传到 GitHub", cls: "github-sync-mode-desc" });
 		pushBtn.addEventListener("click", () => { this.close(); this.onChoose("push"); });
 
-		const pullBtn = btnContainer.createEl("button", { cls: "github-sync-mode-btn" });
+		const pullBtn = btnContainer.createEl("button", { cls: "github-sync-mode-btn mode-pull" });
 		pullBtn.createEl("div", { text: "⬇️", cls: "github-sync-mode-icon" });
 		pullBtn.createEl("div", { text: "Pull", cls: "github-sync-mode-label" });
 		pullBtn.createEl("div", { text: "从 GitHub 下载最新内容到本地", cls: "github-sync-mode-desc" });
 		pullBtn.addEventListener("click", () => { this.close(); this.onChoose("pull"); });
 
-		const timeBtn = btnContainer.createEl("button", { cls: "github-sync-mode-btn" });
+		const timeBtn = btnContainer.createEl("button", { cls: "github-sync-mode-btn mode-time" });
 		timeBtn.createEl("div", { text: "⏱️", cls: "github-sync-mode-icon" });
 		timeBtn.createEl("div", { text: "Push/Pull by Time", cls: "github-sync-mode-label" });
 		timeBtn.createEl("div", { text: "按修改时间自动决定方向", cls: "github-sync-mode-desc" });
 		timeBtn.addEventListener("click", () => { this.close(); this.onChoose("time"); });
 
-		const mergeBtn = btnContainer.createEl("button", { cls: "github-sync-mode-btn" });
+		const mergeBtn = btnContainer.createEl("button", { cls: "github-sync-mode-btn mode-merge" });
 		mergeBtn.createEl("div", { text: "🔀", cls: "github-sync-mode-icon" });
 		mergeBtn.createEl("div", { text: "Smart Merge (beta)", cls: "github-sync-mode-label" });
 		mergeBtn.createEl("div", { text: "自动合并冲突，保留双方修改", cls: "github-sync-mode-desc" });
@@ -159,8 +181,27 @@ export class RollbackModal extends Modal {
 				cls: "github-sync-compare-btn",
 			});
 			allBtns.push(btn);
+			// 两段式确认:第一次点击进入待确认态,4 秒内再次点击才真正回滚
+			let armed = false;
+			let disarmTimer: number | null = null;
+			const disarm = () => {
+				armed = false;
+				if (disarmTimer) { window.clearTimeout(disarmTimer); disarmTimer = null; }
+				btn.textContent = "回滚到此版本";
+				btn.removeClass("github-sync-armed");
+				allBtns.forEach(b => { b.disabled = false; });
+			};
 			btn.addEventListener("click", async (e) => {
 				e.stopPropagation();
+				if (!armed) {
+					armed = true;
+					btn.textContent = "确认回滚？";
+					btn.addClass("github-sync-armed");
+					allBtns.forEach(b => { if (b !== btn) b.disabled = true; });
+					disarmTimer = window.setTimeout(disarm, 4000);
+					return;
+				}
+				if (disarmTimer) { window.clearTimeout(disarmTimer); disarmTimer = null; }
 				allBtns.forEach(b => { b.disabled = true; b.textContent = "回滚中..."; });
 				try {
 					await this.onRollback(snap.id);
@@ -168,6 +209,7 @@ export class RollbackModal extends Modal {
 				} catch (err) {
 					allBtns.forEach(b => { b.disabled = false; b.textContent = "回滚到此版本"; });
 					btn.textContent = "回滚失败";
+					btn.removeClass("github-sync-armed");
 				}
 			});
 		}
@@ -438,10 +480,17 @@ export class ConfirmSyncModal extends Modal {
 				cls: "github-sync-badge badge-unchanged",
 			});
 
-		// 新增：全选/取消全选 按钮
-		const selectAllBtn = contentEl.createEl("button", {
+		// 工具栏：全选 / 已选计数 / 搜索过滤
+		const toolbar = contentEl.createDiv("github-sync-toolbar");
+		const selectAllBtn = toolbar.createEl("button", {
 			text: "取消全选",
 			cls: "github-sync-select-all-btn",
+		});
+		const countEl = toolbar.createEl("span", { cls: "github-sync-selected-count" });
+		const searchInput = toolbar.createEl("input", {
+			type: "search",
+			cls: "github-sync-search",
+			attr: { placeholder: "搜索文件名过滤…" },
 		});
 		let isAllSelected = true;
 		selectAllBtn.addEventListener("click", () => {
@@ -456,6 +505,7 @@ export class ConfirmSyncModal extends Modal {
 				selectAllBtn.setText("全部选中");
 			}
 			this.updateCheckboxes();
+			updateCount();
 		});
 
 		// 文件列表
@@ -467,6 +517,25 @@ export class ConfirmSyncModal extends Modal {
 			...opts.toRemove.map((f) => ({ ...f, _isRemove: true })),
 		].sort((a, b) => a.path.localeCompare(b.path));
 
+		// 已选计数;一个都没选时禁用确认按钮
+		let confirmBtn: HTMLButtonElement | null = null;
+		const updateCount = () => {
+			const sel = this.selectedProcess.size + this.selectedRemove.size;
+			countEl.setText(`已选 ${sel} / ${allFiles.length}`);
+			if (confirmBtn) confirmBtn.disabled = sel === 0;
+		};
+
+		// 按文件名关键字过滤显示(只影响可见性,不改变勾选状态)
+		const applyFilter = () => {
+			const q = searchInput.value.trim().toLowerCase();
+			const rows = listContainer.querySelectorAll<HTMLElement>(".github-sync-file-row");
+			rows.forEach((row) => {
+				const p = (row.dataset.path ?? "").toLowerCase();
+				row.style.display = !q || p.includes(q) ? "" : "none";
+			});
+		};
+		searchInput.addEventListener("input", applyFilter);
+
 		// 最多显示 200 行，超出折叠
 		const displayFiles = allFiles.slice(0, 200);
 		const hasMore = allFiles.length > 200;
@@ -474,6 +543,7 @@ export class ConfirmSyncModal extends Modal {
 		for (const f of displayFiles) {
 			const row = listContainer.createDiv("github-sync-file-row");
 			
+			row.dataset.path = f.path;
 			// 新增：复选框
 			const checkbox = row.createEl("input", { type: "checkbox" });
 			checkbox.checked = f._isRemove
@@ -488,6 +558,7 @@ export class ConfirmSyncModal extends Modal {
 				} else {
 					f._isRemove ? this.selectedRemove.delete(f.path) : this.selectedProcess.delete(f.path);
 				}
+				updateCount();
 			});
 
 			// 核心重构：根据模式和方向决定图标与颜色
@@ -534,6 +605,14 @@ export class ConfirmSyncModal extends Modal {
 			row.createEl("span", { text: icon, cls: "file-icon" });
 			row.createEl("span", { text: f.path, cls: `file-path ${cls}` });
 
+			// 按时间/合并模式：显示方向判定依据（本地/远端修改时间）
+			if ((isSmart || opts.mode === "merge") && (f.localMtime || f.remoteMtime)) {
+				const parts: string[] = [];
+				if (f.localMtime) parts.push(`本地 ${fmtTime(f.localMtime)}`);
+				if (f.remoteMtime) parts.push(`远端 ${fmtTime(f.remoteMtime)}`);
+				row.createEl("span", { text: parts.join(" · "), cls: "file-times" });
+			}
+
 			if (opts.onCompare) {
 				const compareBtn = row.createEl("button", {
 					text: "对比",
@@ -575,7 +654,7 @@ export class ConfirmSyncModal extends Modal {
 			.addButton((btn) =>
 				btn.setButtonText("取消").onClick(() => this.close())
 			)
-			.addButton((btn) =>
+			.addButton((btn) => {
 				btn
 					.setButtonText(`确认${modeLabel}`)
 					.setCta()
@@ -594,8 +673,10 @@ export class ConfirmSyncModal extends Modal {
 						this.opts.onConfirm(sp, sr).catch((err) => {
 							console.error("后台同步出错:", err);
 						});
-					})
-			);
+					});
+				confirmBtn = btn.buttonEl;
+			});
+		updateCount();
 	}
 
 	private updateCheckboxes() {
@@ -615,10 +696,11 @@ export class ConfirmSyncModal extends Modal {
 }
 
 export class ProgressModal extends Modal {
-	private titleEl!: HTMLElement;
+	private progressTitleEl!: HTMLElement;
 	private messageEl!: HTMLElement;
 	private progressEl!: HTMLElement;
 	private progressBarEl!: HTMLElement;
+	private percentEl!: HTMLElement;
 
 	constructor(app: App) {
 		super(app);
@@ -633,7 +715,7 @@ export class ProgressModal extends Modal {
 		contentEl.empty();
 		contentEl.addClass("github-sync-modal", "github-sync-progress-modal");
 
-		this.titleEl = contentEl.createEl("h2", { text: "同步中..." });
+		this.progressTitleEl = contentEl.createEl("h2", { text: "同步中..." });
 		this.messageEl = contentEl.createEl("p", {
 			text: "正在准备...",
 			cls: "github-sync-progress-msg",
@@ -642,10 +724,12 @@ export class ProgressModal extends Modal {
 		this.progressBarEl = this.progressEl.createDiv(
 			"github-sync-progress-bar-fill"
 		);
+		this.percentEl = this.progressEl.createDiv("github-sync-progress-pct");
 	}
 
 	setTitle(text: string) {
-		if (this.titleEl) this.titleEl.setText(text);
+		if (this.progressTitleEl) this.progressTitleEl.setText(text);
+		return this;
 	}
 
 	setMessage(text: string) {
@@ -653,8 +737,18 @@ export class ProgressModal extends Modal {
 	}
 
 	setProgress(pct: number) {
-		if (this.progressBarEl)
-			this.progressBarEl.style.width = `${Math.min(100, pct)}%`;
+		if (!this.progressBarEl || !this.percentEl) return;
+		if (pct < 0) {
+			// 负数 = 总数未知，显示流动的不确定进度条
+			this.progressBarEl.addClass("github-sync-indeterminate");
+			this.progressBarEl.style.width = "35%";
+			this.percentEl.setText("");
+			return;
+		}
+		this.progressBarEl.removeClass("github-sync-indeterminate");
+		const clamped = Math.max(0, Math.min(100, pct));
+		this.progressBarEl.style.width = `${clamped}%`;
+		this.percentEl.setText(`${Math.round(clamped)}%`);
 	}
 
 	onClose() {
@@ -821,6 +915,15 @@ export class DiffViewerModal extends Modal {
 
 		const body = summary.createDiv({ cls: "diff-file-body" });
 
+		if (!remoteInfo.content) {
+			// 内容不可用（超过大小上限或下载失败），避免把本地内容误渲染成"整文件删除"
+			body.createEl("p", {
+				text: "⚠️ 远端内容不可用（文件过大或下载失败），无法对比",
+				cls: "github-sync-warning",
+			});
+			return false;
+		}
+
 		if (localText === remoteText || onlyTrailingBlankLinesDiffer(localText, remoteText)) {
 			body.createEl("p", { text: "文件内容相同", cls: "github-sync-no-changes" });
 			return true;
@@ -984,13 +1087,312 @@ export class UnsyncedWarningModal extends Modal {
 							this.plugin,
 							() => this.onSync(),
 							true,
-							(paths) => this.plugin.onCompareIdentical(paths)
-						).open();
-					})
-			);
+					(paths) => this.plugin.onCompareIdentical(paths)
+				).open();
+			})
+	);
 	}
 
 	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+// ──────────────────────────────────────────────
+// .obsidian 子项选择弹窗
+// ──────────────────────────────────────────────
+
+export class ObsidianSyncPickerModal extends Modal {
+	private plugin: GitHubSyncPlugin;
+	private onSaved: () => void;
+	/** 显式勾选的相对路径;空集 = 同步全部(与旧版语义一致) */
+	private selected = new Set<string>();
+	/** 筛选模式:false = 同步全部(树置灰);true = 按勾选筛选。
+	 *  独立于 selected 维护,否则"筛选模式+未选择"无法表示,总开关会弹回。 */
+	private filterMode: boolean;
+	private preAllSelection: Set<string> | null = null;
+	private masterEl!: HTMLInputElement;
+	private saveBtn: HTMLButtonElement | null = null;
+	private treeContainer!: HTMLElement;
+	private rows = new Map<string, { checkbox: HTMLInputElement; row: HTMLElement; node: PickerNode }>();
+	private expanded = new Set<string>();
+
+	constructor(app: App, plugin: GitHubSyncPlugin, onSaved: () => void) {
+		super(app);
+		this.plugin = plugin;
+		this.onSaved = onSaved;
+		this.selected = new Set(plugin.settings.obsidianSyncSelection);
+		this.filterMode = this.selected.size > 0;
+	}
+
+	/** 空选 = 同步全部(历史语义,保持兼容) */
+	private isAllMode(): boolean {
+		return this.selected.size === 0;
+	}
+
+	/** rel 是否被覆盖:自身或任一祖先被显式选中 */
+	private isCovered(rel: string): boolean {
+		if (this.selected.has(rel)) return true;
+		for (const s of this.selected) {
+			if (rel.startsWith(s + "/")) return true;
+		}
+		return false;
+	}
+
+	private hasSelectedDescendant(rel: string): boolean {
+		for (const s of this.selected) {
+			if (s.startsWith(rel + "/")) return true;
+		}
+		return false;
+	}
+
+	async onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.addClass("github-sync-modal");
+
+		contentEl.createEl("h2", { text: "选择要同步的 .obsidian 子项" });
+
+		// 总开关:同步全部(对应"空选 = 全部"的历史语义)
+		const masterRow = contentEl.createDiv("github-sync-master-row");
+		const masterLabel = masterRow.createEl("label", { cls: "github-sync-master-label" });
+		this.masterEl = masterLabel.createEl("input", { type: "checkbox" });
+		this.masterEl.checked = this.isAllMode();
+		masterLabel.createEl("span", { text: "同步 .obsidian 下全部内容（不筛选）" });
+		masterRow.createEl("span", {
+			text: "取消勾选后可展开文件夹逐级选择",
+			cls: "github-sync-entry-hint",
+		});
+		this.masterEl.addEventListener("change", () => {
+			this.filterMode = !this.masterEl.checked;
+			if (this.filterMode) {
+				// 从"全部"切回筛选:恢复上次的选择快照(若有),否则从空开始
+				if (this.preAllSelection) {
+					this.selected = new Set(this.preAllSelection);
+				}
+			} else {
+				this.preAllSelection = new Set(this.selected);
+				this.selected.clear();
+			}
+			this.refreshAll();
+		});
+
+		const statusEl = contentEl.createEl("p", {
+			text: "正在读取 .obsidian 目录...",
+			cls: "github-sync-subtitle",
+		});
+
+		let roots: PickerNode[] = [];
+		try {
+			roots = await this.listDir(".obsidian", 0);
+		} catch {}
+
+		if (roots.length === 0) {
+			statusEl.setText("⚠️ 无法读取 .obsidian 目录内容");
+			new Setting(contentEl)
+				.addButton((btn) => btn.setButtonText("关闭").onClick(() => this.close()));
+			return;
+		}
+
+		statusEl.setText(
+			"勾选文件夹 = 包含其全部内容；文件夹显示半选表示只同步了部分子项。展开 ▸ 可逐级细分。"
+		);
+
+		this.treeContainer = contentEl.createDiv("github-sync-file-list github-sync-tree");
+		for (const node of roots) this.createRowElement(node);
+
+		new Setting(contentEl)
+			.addButton((btn) =>
+				btn.setButtonText("取消").onClick(() => this.close())
+			)
+			.addButton((btn) => {
+				btn
+					.setButtonText("保存")
+					.setCta()
+					.onClick(async () => {
+						this.plugin.settings.obsidianSyncSelection = Array.from(this.selected).sort();
+						await this.plugin.saveSettings();
+						new Notice(
+							this.isAllMode()
+								? "✅ 已设为同步 .obsidian 下全部内容"
+								: `✅ 将同步 ${this.selected.size} 个选定子项（含其子内容）`
+						);
+						this.onSaved?.();
+						this.close();
+					});
+				this.saveBtn = btn.buttonEl;
+			});
+		this.refreshAll();
+	}
+
+	/** 列出某目录的子节点(rel 相对 .obsidian) */
+	private async listDir(absDir: string, depth: number): Promise<PickerNode[]> {
+		const listing = await this.app.vault.adapter.list(normalizePath(absDir));
+		const relBase = absDir === ".obsidian" ? "" : absDir.slice(".obsidian/".length);
+		const toRel = (f: string) => {
+			const name = f.split("/").pop() ?? f;
+			return relBase ? `${relBase}/${name}` : name;
+		};
+		const nodes: PickerNode[] = [
+			...listing.folders.map((f) => ({ rel: toRel(f), name: toRel(f).split("/").pop() ?? f, isFolder: true, depth })),
+			...listing.files.map((f) => ({ rel: toRel(f), name: toRel(f).split("/").pop() ?? f, isFolder: false, depth })),
+		];
+		nodes.sort((a, b) =>
+			a.isFolder === b.isFolder ? a.name.localeCompare(b.name) : a.isFolder ? -1 : 1
+		);
+		return nodes;
+	}
+
+	/** 创建一行(插入到 ref 之后,保持树的 DOM 顺序) */
+	private createRowElement(node: PickerNode, ref?: HTMLElement): HTMLElement {
+		const row = document.createElement("div");
+		row.className = "github-sync-file-row github-sync-tree-row";
+		row.style.marginLeft = `${node.depth * 18}px`;
+
+		const caret = row.createEl("span", {
+			cls: "github-sync-tree-caret",
+			text: node.isFolder ? "▸" : "",
+		});
+		const cb = row.createEl("input", { type: "checkbox" });
+		row.createEl("span", { text: node.name, cls: "file-path" });
+		const hint = OBSIDIAN_ENTRY_HINTS[node.rel];
+		if (hint) row.createEl("span", { text: hint, cls: "github-sync-entry-hint" });
+
+		if (ref && ref.parentElement) {
+			ref.parentElement.insertBefore(row, ref.nextSibling);
+		} else {
+			this.treeContainer.appendChild(row);
+		}
+
+		cb.addEventListener("change", () => {
+			if (cb.checked) {
+				this.checkNode(node);
+				this.refreshAll();
+			} else {
+				// 反勾选可能需要展开被选祖先(保留其余子树),完成后统一刷新
+				void this.uncheckNode(node).then(() => this.refreshAll());
+			}
+		});
+		row.addEventListener("click", (e) => {
+			if (e.target === cb) return;
+			if (node.isFolder) {
+				void this.toggleExpand(node, caret);
+			} else {
+				cb.checked = !cb.checked;
+				cb.dispatchEvent(new Event("change"));
+			}
+		});
+
+		this.rows.set(node.rel, { checkbox: cb, row, node });
+		this.applyRowState(node.rel);
+		return row;
+	}
+
+	private async toggleExpand(node: PickerNode, caret: HTMLElement) {
+		const entry = this.rows.get(node.rel);
+		if (!entry) return;
+		if (this.expanded.has(node.rel)) {
+			this.expanded.delete(node.rel);
+			caret.setText("▸");
+			for (const [rel, item] of [...this.rows.entries()]) {
+				if (rel.startsWith(node.rel + "/")) {
+					item.row.remove();
+					this.rows.delete(rel);
+				}
+			}
+			return;
+		}
+		this.expanded.add(node.rel);
+		caret.setText("▾");
+		let children: PickerNode[] = [];
+		try {
+			children = await this.listDir(`.obsidian/${node.rel}`, node.depth + 1);
+		} catch {}
+		let ref: HTMLElement = entry.row;
+		for (const child of children) {
+			ref = this.createRowElement(child, ref);
+		}
+	}
+
+	/** 勾选:选中自身;显式选中的后代移除(被自身覆盖) */
+	private checkNode(node: PickerNode) {
+		this.selected.add(node.rel);
+		for (const s of [...this.selected]) {
+			if (s.startsWith(node.rel + "/")) this.selected.delete(s);
+		}
+	}
+
+	/** 反勾选:显式项直接移除;隐式项展开最近的被选祖先,其余子树保持选中 */
+	private async uncheckNode(node: PickerNode) {
+		const rel = node.rel;
+		if (this.selected.has(rel)) {
+			this.selected.delete(rel);
+			for (const s of [...this.selected]) {
+				if (s.startsWith(rel + "/")) this.selected.delete(s);
+			}
+			return;
+		}
+		const anc = this.nearestSelectedAncestor(rel);
+		if (anc) await this.expandSelection(anc, rel);
+	}
+
+	private nearestSelectedAncestor(rel: string): string | null {
+		const parts = rel.split("/");
+		for (let i = parts.length - 1; i > 0; i--) {
+			const anc = parts.slice(0, i).join("/");
+			if (this.selected.has(anc)) return anc;
+		}
+		return null;
+	}
+
+	/** 用祖先的各子项替换祖先本身(排除 excludeRel 子树),保留已有的细分选择 */
+	private async expandSelection(ancestorRel: string, excludeRel: string) {
+		this.selected.delete(ancestorRel);
+		let children: PickerNode[] = [];
+		try {
+			children = await this.listDir(`.obsidian/${ancestorRel}`, 0);
+		} catch {
+			return;
+		}
+		for (const c of children) {
+			if (c.rel === excludeRel || excludeRel.startsWith(c.rel + "/")) continue;
+			if (c.isFolder && this.hasSelectedDescendant(c.rel)) {
+				await this.expandSelection(c.rel, excludeRel);
+			} else {
+				this.selected.add(c.rel);
+			}
+		}
+	}
+
+	private applyRowState(rel: string) {
+		const entry = this.rows.get(rel);
+		if (!entry) return;
+		const { checkbox, node } = entry;
+		if (!this.filterMode) {
+			// 全部模式:整体置灰勾选,不可交互
+			checkbox.checked = true;
+			checkbox.indeterminate = false;
+			checkbox.disabled = true;
+			return;
+		}
+		checkbox.disabled = false;
+		const covered = this.isCovered(rel);
+		checkbox.checked = covered;
+		checkbox.indeterminate = !covered && node.isFolder && this.hasSelectedDescendant(rel);
+	}
+
+	private refreshAll() {
+		if (this.masterEl) this.masterEl.checked = !this.filterMode;
+		for (const rel of this.rows.keys()) this.applyRowState(rel);
+		if (this.saveBtn) {
+			// 筛选模式下至少要勾选一项才能保存,防止误把"清空"当成"全部"
+			this.saveBtn.disabled = this.filterMode && this.selected.size === 0;
+		}
+	}
+
+	onClose() {
+		this.rows.clear();
+		this.expanded.clear();
 		this.contentEl.empty();
 	}
 }
