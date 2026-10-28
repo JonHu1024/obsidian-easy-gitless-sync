@@ -1,7 +1,7 @@
 {
   "id": "easy-gitless-sync",
   "name": "Easy Gitless Sync",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "minAppVersion": "1.0.0",
   "description": "参考Github Gitless Sync写的同步小脚本",
   "author": "JonHu",
