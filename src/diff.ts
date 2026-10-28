@@ -3,13 +3,20 @@
 import type { GitHubFile } from "./github";
 
 export type ChangeType = "added" | "modified" | "deleted" | "unchanged";
-export type SyncDirection = "upload" | "download" | "delete" | "merge";
+export type SyncDirection =
+	| "upload"
+	| "download"
+	| "delete"
+	| "delete-local"
+	| "merge";
 
 export interface FileDiff {
 	path: string;
 	changeType: ChangeType;
 	localMtime?: number;   // 本地文件修改时间
 	remoteMtime?: number;  // GitHub 文件最后修改时间
+	/** remoteMtime 不是精确值，而是用分支最新 commit 时间估算的 */
+	remoteMtimeEstimated?: boolean;
 	remoteSha?: string;    // GitHub 文件 SHA
 	direction?: SyncDirection; // 智能同步时用于展示/执行方向
 }
@@ -39,7 +46,9 @@ export async function computeDiff(
 	localShas: Map<string, string>,
 	remoteFiles: GitHubFile[],
 	ignorePaths: string[],
-	extraIgnore?: (path: string) => boolean
+	extraIgnore?: (path: string) => boolean,
+	/** 只比较这些路径（单文件同步用；省略 = 全部） */
+	onlyPaths?: Set<string>
 ): Promise<DiffResult> {
 	const result: DiffResult = {
 		toUpload: [],
@@ -50,7 +59,9 @@ export async function computeDiff(
 	};
 
 	const skip = (path: string): boolean =>
-		shouldIgnore(path, ignorePaths) || (extraIgnore ? extraIgnore(path) : false);
+		(onlyPaths ? !onlyPaths.has(path) : false) ||
+		shouldIgnore(path, ignorePaths) ||
+		(extraIgnore ? extraIgnore(path) : false);
 
 	// 过滤远端文件
 	const remoteMap = new Map<string, GitHubFile>();

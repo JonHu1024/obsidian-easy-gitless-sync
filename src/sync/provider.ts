@@ -35,6 +35,8 @@ export interface ListResult {
 	commitSha: string | null;
 	treeSha: string | null;
 	commitDate: string;
+	/** true = 已确认远端仓库为空（还没有任何 commit） */
+	isEmpty?: boolean;
 }
 
 export interface CommitResult {

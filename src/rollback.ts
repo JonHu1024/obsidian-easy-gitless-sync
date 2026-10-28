@@ -180,7 +180,7 @@ export class RollbackManager {
 
 	// ── 回滚（源文件从 savings 读，目标写回 vault）──
 
-	async applySnapshot(id: string): Promise<void> {
+	async applySnapshot(id: string): Promise<string[]> {
 		const manifest = await this.readManifest();
 		const meta = manifest.versions.find((v) => v.id === id);
 		if (!meta) {
@@ -188,7 +188,7 @@ export class RollbackManager {
 		}
 
 		const dir = this.savingsPath(id);
-		let restored = 0;
+		const restoredPaths: string[] = [];
 		let failed = 0;
 
 		await pMap(
@@ -224,7 +224,7 @@ export class RollbackManager {
 							await this.app.vault.createBinary(targetPath, content);
 						}
 					}
-					restored++;
+					restoredPaths.push(filePath);
 				} catch (err) {
 					console.warn(`回滚文件失败: ${filePath}`, err);
 					failed++;
@@ -234,8 +234,9 @@ export class RollbackManager {
 		);
 
 		new Notice(
-			`↩️ 回滚完成：恢复 ${restored} 个文件${failed > 0 ? `，${failed} 个失败` : ""}`
+			`↩️ 回滚完成：恢复 ${restoredPaths.length} 个文件${failed > 0 ? `，${failed} 个失败` : ""}`
 		);
+		return restoredPaths;
 	}
 
 	// ── 删除指定快照（回滚完成后清理用）──

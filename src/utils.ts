@@ -1,5 +1,17 @@
 // utils.ts — 通用工具函数
 
+export function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 受控并发的 map。
+ *
+ * 任一任务失败后不再派发新任务：调用方一旦抛出"系统性错误"
+ * （Token 失效 / 限流 / 网络），剩余几百个请求就不该继续打出去，
+ * 否则只会把限流越踩越深、控制台堆满噪声。
+ * （单个文件的数据类错误由调用方自行捕获跳过，不会走到这里。）
+ */
 export async function pMap<T, R>(
 	items: T[],
 	fn: (item: T) => Promise<R>,
@@ -8,10 +20,18 @@ export async function pMap<T, R>(
 	if (items.length === 0) return [];
 	const results: R[] = new Array(items.length);
 	let idx = 0;
-	async function worker() {
+	let failed = false;
+	async function worker(): Promise<void> {
 		while (idx < items.length) {
+			if (failed) return;
 			const i = idx++;
-			results[i] = await fn(items[i]);
+			try {
+				results[i] = await fn(items[i]);
+			} catch (err) {
+				// 中断派发；已经在飞的请求无法取消，但不会再新增
+				failed = true;
+				throw err;
+			}
 		}
 	}
 	await Promise.all(
@@ -23,11 +43,11 @@ export async function pMap<T, R>(
 export function arrayBufferToBase64(buffer: ArrayBuffer): string {
 	const bytes = new Uint8Array(buffer);
 	const chunkSize = 0x8000;
-	let binary = "";
+	const chunks: string[] = [];
 	for (let i = 0; i < bytes.length; i += chunkSize) {
-		binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+		chunks.push(String.fromCharCode(...bytes.subarray(i, i + chunkSize)));
 	}
-	return btoa(binary);
+	return btoa(chunks.join(""));
 }
 
 export function strToArrayBuffer(s: string): ArrayBuffer {
