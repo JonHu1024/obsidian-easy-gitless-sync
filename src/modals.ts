@@ -2,7 +2,7 @@
 
 import { App, Modal, Notice, Setting, TFile, normalizePath, setIcon } from "obsidian";
 import { FileDiff, isTextFile, computeGitBlobSha, SyncDirection } from "./diff";
-import type { RollbackSnapshot } from "./types";
+import type { RollbackSnapshot, SyncMode } from "./types";
 import { MergeView } from "@codemirror/merge";
 import { EditorState } from "@codemirror/state";
 import { EditorView, lineNumbers } from "@codemirror/view";
@@ -10,8 +10,6 @@ import { GitHubClient, GitHubFile } from "./github";
 import { arrayBuffersEqual, pMap } from "./utils";
 import { SAVINGS_DIR } from "./rollback";
 import type GitHubSyncPlugin from "./main";
-
-export type SyncMode = "push" | "pull" | "time" | "merge";
 
 /** 两端只有尾部空行差异 → 视为相同 */
 function onlyTrailingBlankLinesDiffer(a: string, b: string): boolean {
@@ -71,7 +69,7 @@ export class SyncModeModal extends Modal {
 		contentEl.empty();
 		contentEl.addClass("github-sync-modal", "github-sync-mode-modal");
 
-		contentEl.createEl("h2", { text: "GitHub 同步" });
+		contentEl.createEl("h2", { text: "Easy Gitless Sync" });
 		contentEl.createEl("p", {
 			text: "选择同步模式",
 			cls: "github-sync-subtitle",
@@ -146,35 +144,77 @@ export class RollbackModal extends Modal {
 	}
 
 	onOpen() {
-		this.modalEl.addClass("github-sync-rollback-host");
+		this.modalEl.addClass("github-sync-rollback-host", "egs-rollback-host");
 		const { contentEl } = this;
 		contentEl.empty();
-		contentEl.addClass("github-sync-modal", "github-sync-rollback-modal");
-		contentEl.createEl("h2", { text: "↩️ 回滚到上个版本" });
+		contentEl.addClass(
+			"github-sync-modal",
+			"github-sync-rollback-modal",
+			"egs-rollback-modal"
+		);
+		const titleRow = contentEl.createDiv("egs-title-row");
+		titleRow.createEl("h2", { text: "↩️ 历史版本" });
+		titleRow.createEl("span", {
+			text: `${this.snapshots.length} 个快照`,
+			cls: "egs-repo-pill",
+		});
 
 		if (this.snapshots.length === 0) {
 			contentEl.createEl("p", {
-				text: "暂无历史版本",
+				text: "暂无历史版本；执行一次同步后会自动生成快照。",
 				cls: "github-sync-no-changes",
 			});
-			new Setting(contentEl)
-				.addButton((btn) =>
-					btn.setButtonText("关闭").onClick(() => this.close())
-				);
+			const emptyFooter = contentEl.createDiv("egs-footer");
+			const emptyActions = emptyFooter.createDiv("egs-footer-actions");
+			const emptyClose = emptyActions.createEl("button", {
+				text: "关闭",
+				cls: "egs-btn",
+			});
+			emptyClose.addEventListener("click", () => this.close());
 			return;
 		}
 
 		contentEl.createEl("p", {
-			text: `共 ${this.snapshots.length} 个历史版本（每次同步自动生成）`,
+			text: "每次同步前自动生成差量快照；只包含该次同步涉及的文件。",
 			cls: "github-sync-subtitle",
 		});
 
-		const listContainer = contentEl.createDiv("github-sync-file-list");
+		const listContainer = contentEl.createDiv(
+			"egs-list github-sync-file-list egs-rollback-list"
+		);
 		const allBtns: HTMLButtonElement[] = [];
 
 		for (const snap of this.snapshots) {
+			try {
+				this.renderSnapshotRow(listContainer, snap, allBtns);
+			} catch (err) {
+				// 单行渲染失败不能影响其它行（例如某个图标/元素创建失败）
+				console.error("渲染回滚条目失败:", snap.id, err);
+			}
+		}
+
+		const footer = contentEl.createDiv("egs-footer");
+		const status = footer.createDiv("egs-footer-status");
+		status.createEl("div", {
+			text: "回滚会恢复本地文件，并重新标记为未同步。",
+			cls: "egs-status egs-status-idle",
+		});
+		const footerActions = footer.createDiv("egs-footer-actions");
+		const closeBtn = footerActions.createEl("button", {
+			text: "关闭",
+			cls: "egs-btn",
+		});
+		closeBtn.addEventListener("click", () => this.close());
+	}
+
+	private renderSnapshotRow(
+		listContainer: HTMLElement,
+		snap: RollbackSnapshot,
+		allBtns: HTMLButtonElement[]
+	) {
+		{
 			const row = listContainer.createDiv({
-				cls: "github-sync-file-row github-sync-snapshot-row",
+				cls: "github-sync-file-row github-sync-snapshot-row egs-snapshot-row",
 			});
 
 			const dateStr = new Date(snap.date).toLocaleString();
@@ -193,28 +233,37 @@ export class RollbackModal extends Modal {
 
 			const actionsEl = row.createDiv("github-sync-row-actions");
 			const compareBtn = actionsEl.createEl("button", {
-				cls: "github-sync-icon-btn",
-				attr: { title: "对比此快照", "aria-label": "对比" },
+				text: "对比",
+				cls: "egs-compare-btn",
+				attr: {
+					title: "对比此快照与当前本地内容",
+					"aria-label": "对比",
+				},
 			});
-			setIcon(compareBtn, "diff");
-			if (compareBtn.childElementCount === 0) compareBtn.setText("⇄");
 			compareBtn.addEventListener("click", (e) => {
 				e.stopPropagation();
 				new RollbackDiffModal(this.app, snap).open();
 			});
 
 			const btn = actionsEl.createEl("button", {
-				text: "回滚",
-				cls: "github-sync-restore-btn",
+				cls: "github-sync-restore-btn egs-restore-btn",
+				attr: { title: "回滚到此快照" },
 			});
+			setIcon(btn, "history");
+			btn.createSpan({ text: "回滚", cls: "egs-restore-label" });
 			allBtns.push(btn);
+			const setRestoreText = (b: HTMLButtonElement, text: string) => {
+				const label = b.querySelector<HTMLElement>(".egs-restore-label");
+				if (label) label.setText(text);
+				else b.setText(text);
+			};
 			// 两段式确认:第一次点击进入待确认态,4 秒内再次点击才真正回滚
 			let armed = false;
 			let disarmTimer: number | null = null;
 			const disarm = () => {
 				armed = false;
 				if (disarmTimer) { window.clearTimeout(disarmTimer); disarmTimer = null; }
-				btn.textContent = "回滚";
+				setRestoreText(btn, "回滚");
 				btn.removeClass("github-sync-armed");
 				allBtns.forEach(b => { b.disabled = false; });
 			};
@@ -222,20 +271,26 @@ export class RollbackModal extends Modal {
 				e.stopPropagation();
 				if (!armed) {
 					armed = true;
-					btn.textContent = "确认回滚？";
+					setRestoreText(btn, "确认回滚？");
 					btn.addClass("github-sync-armed");
 					allBtns.forEach(b => { if (b !== btn) b.disabled = true; });
 					disarmTimer = window.setTimeout(disarm, 4000);
 					return;
 				}
 				if (disarmTimer) { window.clearTimeout(disarmTimer); disarmTimer = null; }
-				allBtns.forEach(b => { b.disabled = true; b.textContent = "回滚中..."; });
+				allBtns.forEach(b => {
+					b.disabled = true;
+					setRestoreText(b, "回滚中...");
+				});
 				try {
 					await this.onRollback(snap.id);
 					this.close();
 				} catch (err) {
-					allBtns.forEach(b => { b.disabled = false; b.textContent = "回滚到此版本"; });
-					btn.textContent = "回滚失败";
+					allBtns.forEach(b => {
+						b.disabled = false;
+						setRestoreText(b, "回滚");
+					});
+					setRestoreText(btn, "回滚失败");
 					btn.removeClass("github-sync-armed");
 				}
 			});
@@ -271,6 +326,19 @@ export class RollbackDiffModal extends Modal {
 
 		const dateStr = new Date(this.snapshot.date).toLocaleString();
 		contentEl.createEl("h2", { text: `对比快照 (${dateStr})` });
+		contentEl.createEl("p", {
+			text: "左栏是当前文件，右栏是同步前的快照。",
+			cls: "github-sync-subtitle",
+		});
+		const legend = contentEl.createDiv("egs-diff-sides egs-rollback-compare-legend");
+		legend.createEl("span", {
+			text: "当前文件（左）",
+			cls: "egs-diff-side-label",
+		});
+		legend.createEl("span", {
+			text: "快照（右）",
+			cls: "egs-diff-side-label",
+		});
 
 		const statusEl = contentEl.createDiv({ cls: "github-sync-progress-modal" });
 		statusEl.createEl("p", { text: "正在读取文件...", cls: "github-sync-progress-msg" });
@@ -385,6 +453,15 @@ export class RollbackDiffModal extends Modal {
 		}
 
 		if (this.closed) return;
+		const sides = body.createDiv("egs-diff-sides");
+		sides.createEl("span", {
+			text: "当前文件",
+			cls: "egs-diff-side-label",
+		});
+		sides.createEl("span", {
+			text: "快照",
+			cls: "egs-diff-side-label",
+		});
 		const container = body.createDiv({ cls: "cm-merge-view" });
 
 		const readOnlyExt = [
@@ -431,7 +508,7 @@ export class RollbackDiffModal extends Modal {
 
 		const table = body.createEl("table", { cls: "diff-binary-table" });
 		const localRow = table.insertRow();
-		localRow.insertCell().textContent = "本地大小";
+		localRow.insertCell().textContent = "当前文件大小";
 		localRow.insertCell().textContent = `${localContent.byteLength} bytes`;
 
 		const snapRow = table.insertRow();
@@ -713,7 +790,12 @@ export class ConfirmSyncModal extends Modal {
 			return;
 		}
 		for (const child of root.children) {
-			this.renderNode(child, this.listContainer, 0, "");
+			try {
+				this.renderNode(child, this.listContainer, 0, "");
+			} catch (err) {
+				// 单行渲染失败不能影响其它行
+				console.error("渲染同步列表条目失败:", err);
+			}
 		}
 		this.syncUI();
 	}
@@ -896,7 +978,11 @@ export class ConfirmSyncModal extends Modal {
 		this.folderRows.set(node.path, { checkbox, countEl, node });
 		if (isExpanded) {
 			for (const child of node.children) {
-				this.renderNode(child, parentEl, depth + 1, node.path);
+				try {
+					this.renderNode(child, parentEl, depth + 1, node.path);
+				} catch (err) {
+					console.error("渲染同步列表条目失败:", err);
+				}
 			}
 		}
 	}
@@ -993,11 +1079,10 @@ export class ConfirmSyncModal extends Modal {
 
 		if (this.opts.onCompare) {
 			const compareBtn = actionsEl.createEl("button", {
-				cls: "github-sync-icon-btn",
-				attr: { title: "对比本地与 GitHub 内容", "aria-label": "对比" },
+				text: "对比",
+				cls: "github-sync-compare-btn",
+				attr: { title: "对比本地与 GitHub 内容" },
 			});
-			setIcon(compareBtn, "diff");
-			if (compareBtn.childElementCount === 0) compareBtn.setText("⇄");
 			compareBtn.addEventListener("click", (e) => {
 				e.stopPropagation();
 				this.opts.onCompare!(entry.path);
@@ -1009,7 +1094,7 @@ export class ConfirmSyncModal extends Modal {
 			if (
 				e.target !== checkbox &&
 				!(e.target as HTMLElement).closest?.(
-					".github-sync-compare-btn, .github-sync-icon-btn, .github-sync-action-select"
+					".github-sync-compare-btn, .github-sync-action-select"
 				)
 			) {
 				checkbox.checked = !checkbox.checked;
@@ -1566,7 +1651,7 @@ export class DiffViewerModal extends Modal {
 	) {
 		const table = body.createEl("table", { cls: "diff-binary-table" });
 		const localRow = table.insertRow();
-		localRow.insertCell().textContent = "本地大小";
+		localRow.insertCell().textContent = "当前文件大小";
 		localRow.insertCell().textContent = this.formatSize(localContent ? localContent.byteLength : 0);
 		const remoteRow = table.insertRow();
 		remoteRow.insertCell().textContent = "GitHub 大小";

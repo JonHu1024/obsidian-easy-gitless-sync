@@ -1,17 +1,22 @@
 // main.ts — GitHub Sync 插件入口
 
-import { Notice, Plugin, TFile, TAbstractFile, Menu, normalizePath } from "obsidian";
+import {
+	Notice,
+	Plugin,
+	TFile,
+	TAbstractFile,
+	Menu,
+	normalizePath,
+	setIcon,
+} from "obsidian";
 import { GitHubClient, GitHubFile, PartialUploadError } from "./github";
 import { computeDiff, computeGitBlobSha, DiffResult, FileDiff, isTextFile, mergeTexts } from "./diff";
 import {
-	ConfirmSyncModal,
 	DiffViewerModal,
-	ProgressModal,
-	SyncMode,
 	RollbackModal,
-	SyncModeModal,
 	UnsyncedWarningModal,
 } from "./modals";
+import { SyncWorkspaceModal } from "./workspace";
 import {
 	DEFAULT_SETTINGS,
 	GitHubSyncSettings,
@@ -20,12 +25,39 @@ import {
 import { CSS } from "./styles";
 import { pMap, strToArrayBuffer, getErrorMessage } from "./utils";
 import { RollbackManager } from "./rollback";
+import {
+	LocalFileSnapshot,
+	ModePlan,
+	RemoteSnapshot,
+	SmartSyncPlan,
+	SyncBase,
+	SyncMode,
+	SyncProgressReporter,
+} from "./types";
 
 /** sha 缓存条目:mtime+size 未变即复用 sha,跳过读取与哈希 */
 interface HashCacheEntry {
 	mtime: number;
 	size: number;
 	sha: string;
+}
+
+interface RemoteMtimeEntry {
+	sha: string;
+	mtime: number;
+}
+
+/**
+ * 远端文件 mtime 缓存。
+ *
+ * 命中条件是"文件的 blob sha 没变"，而不是 HEAD 没变：
+ * HEAD 变了通常只是个别文件被改，其它文件的时间依然有效，
+ * 这样能避免每次同步后整批重新查询 /commits?path=。
+ */
+interface RemoteMtimeCache {
+	/** 仅作记录：写缓存时的 HEAD（不参与命中判断） */
+	headCommitSha: string | null;
+	entries: Record<string, RemoteMtimeEntry>;
 }
 
 /** 本地 sha 缓存文件(adapter 读写,不进 vault 索引) */
@@ -37,6 +69,32 @@ const REMOTE_MTIME_CACHE_PATH =
 
 /** syncedPaths 持久化上限(超出裁剪旧记录) */
 const SYNCED_PATHS_CAP = 5000;
+
+/**
+ * 把执行器的详细进度压成状态栏能放下的短文本。
+ *
+ * 例："⬆️ 上传中 3/12：notes/a.md" → "⬆️ 3/12"
+ */
+function compactSyncProgress(text: string): string {
+	const m =
+		/^(⬆️|⬇️|🔀|🗑️|⚠️|✅)?\s*[^0-9]*?(\d+)\s*\/\s*(\d+)/.exec(text);
+	if (m) return `${m[1] ? m[1] + " " : ""}${m[2]}/${m[3]}`;
+	const trimmed = text.trim();
+	if (!trimmed) return "同步中";
+	return trimmed.length > 16 ? `${trimmed.slice(0, 16)}…` : trimmed;
+}
+
+/** 两份本地指纹是否完全一致（文件集合 + 每个文件的 mtime:size） */
+function stampsEqual(
+	a: Map<string, string>,
+	b: Map<string, string>
+): boolean {
+	if (a.size !== b.size) return false;
+	for (const [path, value] of a) {
+		if (b.get(path) !== value) return false;
+	}
+	return true;
+}
 
 /**
  * 插件自身状态文件永远不参与同步。
@@ -54,46 +112,6 @@ const PLUGIN_STATE_PREFIXES = [
 	".obsidian/plugins/easy-gitless-sync/remote-cache.json",
 ];
 
-/** 远端文件列表快照（启动时静默预取，点击同步时按 HEAD 复用） */
-interface RemoteSnapshot {
-	files: GitHubFile[];
-	commitSha: string | null;
-	treeSha: string | null;
-	commitDate: string;
-	isEmpty: boolean;
-	fetchedAt: number;
-}
-
-interface RemoteMtimeEntry {
-	sha: string;
-	mtime: number;
-}
-
-/** 只在同一 headCommitSha 下可信：commit 变化后一律重新查询，避免把旧时间当成新时间 */
-interface RemoteMtimeCache {
-	headCommitSha: string | null;
-	entries: Record<string, RemoteMtimeEntry>;
-}
-
-interface LocalFileSnapshot {
-	/** path -> 内容;未变化的文件为 null(sha 已与远端一致,后续流程用不到内容) */
-	files: Map<string, ArrayBuffer | null>;
-	mtimes: Map<string, number>;
-	/** 本地 git blob sha(读取阶段预计算/缓存) */
-	shas: Map<string, string>;
-	/** 读取失败的文件:本次同步对其"不可见",避免被误判为删除/新增 */
-	failedPaths: string[];
-}
-
-interface SmartSyncPlan {
-	uploads: FileDiff[];
-	downloads: FileDiff[];
-	deletions: FileDiff[];
-	merges: FileDiff[];
-	previewItems: FileDiff[];
-	unchanged: number;
-}
-
 export default class GitHubSyncPlugin extends Plugin {
 	settings!: GitHubSyncSettings;
 	private isSyncing = false;
@@ -107,6 +125,8 @@ export default class GitHubSyncPlugin extends Plugin {
 	private ignoreListCache: string[] | null = null; // 忽略路径解析缓存
 	private recentlySyncedPaths = new Set<string>();// 冷却池：防止同步写入触发的 modify 被误判
 	private rollbackManager!: RollbackManager;
+	/** 当前打开的工作台（只允许一个，避免并发准备/执行） */
+	activeWorkspace: SyncWorkspaceModal | null = null;
 	/** 本次同步新建过的文件夹（避免每个文件都 adapter.exists） */
 	private knownFolders = new Set<string>();
 
@@ -121,6 +141,26 @@ export default class GitHubSyncPlugin extends Plugin {
 	private startupWarningTimer: number | null = null;
 	/** 本会话已确认过写权限的 token+repo，避免每次同步都多打一次 /repos */
 	private writePermissionKey = "";
+
+	// ── 静默对比（启动时把远端列表 + 本地扫描 + diff 一次算完） ──
+	/** 已完成的对比结果；远端 HEAD 与本地文件都没变时可直接复用 */
+	private preparedBase: SyncBase | null = null;
+	/** 上面那次对比时本地文件的 "mtime:size" 快照，用来判断本地是否变过 */
+	private preparedBaseStamp: Map<string, string> | null = null;
+	/** 上面那次对比使用的忽略列表；忽略规则变了就不能复用 */
+	private preparedBaseIgnore = "";
+	/** 静默对比在途 Promise：用户中途点同步时等它，不重复请求 */
+	private preparedBasePromise: Promise<SyncBase> | null = null;
+
+	// ── 后台同步（窗口关闭后继续跑，状态显示在右上角） ──
+	/** 后台同步任务是否在跑 */
+	private backgroundSyncRunning = false;
+	/** 同步进度文案（状态栏提示 + 右上角卡片用） */
+	private syncProgressText = "";
+	/** 右上角同步卡片 */
+	private syncToast: HTMLElement | null = null;
+	/** 右上角卡片自动收起的定时器 */
+	private toastTimer: number | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -158,38 +198,38 @@ export default class GitHubSyncPlugin extends Plugin {
 
 		// 左侧边栏图标
 		this.addRibbonIcon("github", "Easy Gitless Sync", () => {
-			this.openSyncModal();
+			this.openSyncWorkspace();
 		});
 
 		// 命令面板
 		this.addCommand({
 			id: "open-sync-modal",
-			name: "打开同步对话框",
-			callback: () => this.openSyncModal(),
+			name: "打开同步工作台",
+			callback: () => this.openSyncWorkspace(),
 		});
 
 		this.addCommand({
 			id: "quick-push",
-			name: "Quick Push(直接显示差异确认)",
-			callback: () => this.startSync("push"),
+			name: "Quick Push（打开工作台并选中 Push）",
+			callback: () => this.openSyncWorkspace("push"),
 		});
 
 		this.addCommand({
 			id: "quick-pull",
-			name: "Quick Pull(直接显示差异确认)",
-			callback: () => this.startSync("pull"),
+			name: "Quick Pull（打开工作台并选中 Pull）",
+			callback: () => this.openSyncWorkspace("pull"),
 		});
 
 		this.addCommand({
 			id: "quick-time",
-			name: "按时间同步(按修改时间自动决定方向)",
-			callback: () => this.startSync("time"),
+			name: "按时间同步（打开工作台并选中 By Time）",
+			callback: () => this.openSyncWorkspace("time"),
 		});
 
 		this.addCommand({
 			id: "quick-merge",
-			name: "智能合并(自动合并冲突文件)",
-			callback: () => this.startSync("merge"),
+			name: "智能合并（打开工作台并选中 Merge）",
+			callback: () => this.openSyncWorkspace("merge"),
 		});
 
 		// 设置选项卡
@@ -280,12 +320,7 @@ export default class GitHubSyncPlugin extends Plugin {
 								.setTitle("Easy Gitless Sync")
 								.setIcon("github")
 								.onClick(() => {
-									new SyncModeModal(
-										this.app,
-										(mode) => this.startSync(mode, file.path),
-										() => this.openRollback(),
-										() => this.describeRemoteCache()
-									).open();
+									this.openSyncWorkspace(undefined, file.path);
 								});
 						});
 					}
@@ -299,6 +334,8 @@ export default class GitHubSyncPlugin extends Plugin {
 	}
 
 	onunload() {
+		this.activeWorkspace?.close();
+		this.activeWorkspace = null;
 		if (this.prefetchTimer) {
 			window.clearTimeout(this.prefetchTimer);
 			this.prefetchTimer = null;
@@ -485,21 +522,40 @@ export default class GitHubSyncPlugin extends Plugin {
 
 	// 新增：更新状态栏 UI
 	private updateStatusBar() {
-		if (this.isSyncing || this.isPreparing) {
-			this.statusBarEl.setText("🔄GitHub同步中...");
-			this.statusBarEl.style.color = "var(--text-accent, #7c8cff)";
-			this.statusBarEl.style.cursor = "default";
-			this.statusBarEl.title = "同步进行中";
+		if (!this.statusBarEl) return;
+		const syncing = this.isSyncing || this.isPreparing;
+		const tone = syncing ? "syncing" : this.isDirty ? "not-sync" : "sync";
+		// 右下角状态栏只在 PC 端存在，只做"是否在同步"的提示，不做实时进度
+		const label = syncing ? "Sync..." : this.isDirty ? "NOT Sync" : "Sync";
+
+		this.statusBarEl.empty();
+		this.statusBarEl.style.color = "";
+		this.statusBarEl.style.cursor = syncing ? "default" : "pointer";
+		const icon = this.statusBarEl.createSpan({
+			cls: `egs-bar-icon egs-bar-${tone}`,
+		});
+		setIcon(icon, "github");
+		if (icon.childElementCount === 0) icon.setText("◉");
+		this.statusBarEl.createSpan({
+			text: label,
+			cls: `egs-bar-label egs-bar-${tone}`,
+		});
+
+		if (syncing) {
+			this.statusBarEl.title = "同步进行中（右上角查看详情）";
 			this.statusBarEl.onclick = null;
 			return;
 		}
-		if (this.isDirty) {
-			this.statusBarEl.setText("⚠️GitHub未同步");
-			this.statusBarEl.style.color = "var(--text-warning, #e6922a)";
-			this.statusBarEl.style.cursor = "pointer";
-			this.statusBarEl.title = "为强迫症用户设计。如有新的文件修改，仍将切换为未同步的状态";
-			this.statusBarEl.onclick = (event: MouseEvent) => {
-				const menu = new Menu();
+
+		this.statusBarEl.title = this.isDirty
+			? "有未同步的修改；点击打开同步工作台"
+			: "已同步；点击打开同步工作台";
+		this.statusBarEl.onclick = (event: MouseEvent) => {
+			const menu = new Menu();
+			menu.addItem((item) =>
+				item.setTitle("打开同步工作台").onClick(() => this.openSyncWorkspace())
+			);
+			if (this.isDirty) {
 				menu.addItem((item) =>
 					item.setTitle("对比未同步文件").onClick(() => {
 						if (this.unsyncedPaths.size > 0) {
@@ -507,12 +563,12 @@ export default class GitHubSyncPlugin extends Plugin {
 								this.app,
 								Array.from(this.unsyncedPaths),
 								this,
-								() => this.openSyncModal(),
+								() => this.openSyncWorkspace(),
 								true,
 								(paths) => this.onCompareIdentical(paths)
 							).open();
 						} else {
-							this.openSyncModal();
+							this.openSyncWorkspace();
 						}
 					})
 				);
@@ -522,17 +578,16 @@ export default class GitHubSyncPlugin extends Plugin {
 						new Notice("✅ 已标记为已同步状态");
 					})
 				);
-				menu.showAtMouseEvent(event);
-			};
-		} else {
-			this.statusBarEl.setText("✅GitHub已同步");
-			this.statusBarEl.style.color = "var(--text-success, #28a745)";
-			this.statusBarEl.style.cursor = "default";
-			this.statusBarEl.title = "";
-			this.statusBarEl.onclick = null;
-		}
+			} else {
+				menu.addItem((item) =>
+					item.setTitle("查看历史版本").onClick(() => {
+						void this.openRollback();
+					})
+				);
+			}
+			menu.showAtMouseEvent(event);
+		};
 	}
-
 	async loadSettings() {
 		this.settings = Object.assign(
 			{},
@@ -600,14 +655,38 @@ export default class GitHubSyncPlugin extends Plugin {
 	// 同步入口
 	// ──────────────────────────────────────────────
 
-	private openSyncModal() {
+	/**
+	 * 所有同步入口都走这里：打开统一工作台。
+	 * mode 为空时使用此设备上次选择的模式（默认 By Time）。
+	 */
+	openSyncWorkspace(mode?: SyncMode, targetPath?: string): void {
 		if (!this.checkConfig()) return;
-		new SyncModeModal(
-			this.app,
-			(mode) => this.startSync(mode),
-			() => this.openRollback(),
-			() => this.describeRemoteCache()
-		).open();
+		if (this.isSyncing) {
+			new Notice("正在同步，请等待当前任务结束");
+			return;
+		}
+		if (this.activeWorkspace) {
+			this.activeWorkspace.focusMode(mode);
+			return;
+		}
+		if (this.isPreparing) {
+			new Notice("正在准备同步数据，请稍候");
+			return;
+		}
+		const modal = new SyncWorkspaceModal(this.app, this, {
+			mode,
+			targetPath,
+		});
+		modal.onClosed = () => {
+			if (this.activeWorkspace === modal) this.activeWorkspace = null;
+		};
+		this.activeWorkspace = modal;
+		modal.open();
+	}
+
+	/** 兼容旧调用点（quick commands / 旧代码） */
+	startSync(mode?: SyncMode, targetPath?: string): void {
+		this.openSyncWorkspace(mode, targetPath);
 	}
 
 	// ──────────────────────────────────────────────
@@ -630,6 +709,10 @@ export default class GitHubSyncPlugin extends Plugin {
 		this.remoteFetchPromise = null;
 		this.remoteCacheEpoch++;
 		this.remoteFetchEpoch = this.remoteCacheEpoch;
+		// 换了仓库，之前那份"远端 vs 本地"的对比结果也不能用了
+		this.preparedBase = null;
+		this.preparedBaseStamp = null;
+		this.preparedBaseIgnore = "";
 	}
 
 	/** 远端被本次同步改写后调用：作废缓存，并在后台重新预取 */
@@ -643,6 +726,10 @@ export default class GitHubSyncPlugin extends Plugin {
 		this.remoteCacheKey = this.remoteCacheKeyForSettings();
 		this.remoteFetchKey = "";
 		this.remoteFetchPromise = null;
+		// 远端被改写 → 上次的对比结果作废（HEAD 已经变了）
+		this.preparedBase = null;
+		this.preparedBaseStamp = null;
+		this.preparedBaseIgnore = "";
 		this.remoteCacheEpoch++;
 		this.remoteFetchEpoch = this.remoteCacheEpoch;
 	}
@@ -761,7 +848,7 @@ export default class GitHubSyncPlugin extends Plugin {
 				new UnsyncedWarningModal(
 					this.app,
 					validPaths,
-					() => this.openSyncModal(),
+					() => this.openSyncWorkspace(),
 					this,
 					// 用户关掉提醒（无论点"我知道了"、右上角还是"去同步"）后再预取
 					() => this.scheduleRemotePrefetch(600)
@@ -786,7 +873,15 @@ export default class GitHubSyncPlugin extends Plugin {
 		}, delayMs);
 	}
 
-	/** 静默预取：不弹窗、不打扰；失败只写 console.debug */
+	/**
+	 * 静默预取：**把完整的"远端 vs 本地"对比一次算完**。
+	 *
+	 * · 启动后（或用户关掉未同步提醒后）自动执行，不弹窗、不打扰；
+	 * · 用户中途点"同步"时，prepareSyncBase 会等这个在途 Promise，
+	 *   不会重复拉列表、也不会重复扫本地；
+	 * · 算完后缓存在 preparedBase 里；下次点"同步"只要远端 HEAD 没变、
+	 *   本地文件没变，就直接复用这份结果（只多 1 个 HEAD 请求做校验）。
+	 */
 	private async maybePrefetchRemote(): Promise<void> {
 		if (!this.settings.prefetchRemoteOnStartup) return;
 		const token = (this.settings.token || "").trim();
@@ -811,14 +906,23 @@ export default class GitHubSyncPlugin extends Plugin {
 			const client = new GitHubClient(token, repository, branch, {
 				uploadConcurrency: this.settings.uploadConcurrency,
 			});
-			const result = await this.getRemoteSnapshot(client);
-			console.debug(
-				`[Easy Gitless Sync] 静默预取完成：${result.snapshot.files.length} 个文件` +
-					`${result.reused ? "（缓存命中）" : ""}`
-			);
+			// 共享同一个 Promise：用户中途点同步会 await 它，不重复请求
+			const promise = this.buildSyncBase(client, undefined);
+			this.preparedBasePromise = promise;
+			try {
+				const base = await promise;
+				console.debug(
+					`[Easy Gitless Sync] 静默对比完成：远端 ${base.remote.files.length} 个文件，` +
+						`本地待同步 ${base.diff.toUpload.length + base.diff.toDownload.length} 个`
+				);
+			} finally {
+				if (this.preparedBasePromise === promise) {
+					this.preparedBasePromise = null;
+				}
+			}
 		} catch (err) {
 			console.debug(
-				"[Easy Gitless Sync] 静默预取失败（不影响手动同步）:",
+				"[Easy Gitless Sync] 静默对比失败（不影响手动同步）:",
 				getErrorMessage(err)
 			);
 		}
@@ -851,220 +955,508 @@ export default class GitHubSyncPlugin extends Plugin {
 		);
 	}
 
-	async startSync(mode: SyncMode, targetPath?: string) {
-		if (!this.checkConfig()) return;
-
-		if (this.isSyncing || this.isPreparing) {
-			new Notice("正在同步...(点击屏幕空白区域可以后台运行同步)");
-			return;
-		}
+	/**
+	 * 工作台准备阶段：远端索引 + 本地快照 + 基础 diff。
+	 *
+	 * 切换顶部选项卡时复用这份结果，只重新生成当前模式的列表。
+	 */
+	async prepareSyncBase(
+		targetPath?: string,
+		onProgress?: (message: string, percent?: number) => void
+	): Promise<SyncBase> {
+		if (!this.checkConfig()) throw new Error("插件尚未配置");
+		if (this.isSyncing) throw new Error("正在同步，请等待当前任务结束");
+		if (this.isPreparing) throw new Error("正在准备同步数据，请稍候");
 
 		this.isPreparing = true;
 		this.knownFolders.clear();
-		// 还没开始的静默预取就取消；已经在飞的请求会通过 getRemoteSnapshot 复用
+		// 还没开始的静默预取就取消；已经在飞的请求会被 getRemoteSnapshot 复用
 		if (this.prefetchTimer) {
 			window.clearTimeout(this.prefetchTimer);
 			this.prefetchTimer = null;
 		}
 		this.updateStatusBar();
-		const progress = new ProgressModal(this.app);
-		progress.open();
 
 		try {
 			const token = (this.settings.token || "").trim();
 			const repository = (this.settings.repository || "").trim();
 			const branch = (this.settings.branch || "main").trim() || "main";
-			const ignore = this.buildIgnoreList();
 
 			const client = new GitHubClient(token, repository, branch, {
 				uploadConcurrency: this.settings.uploadConcurrency,
 			});
 
-			// 0. 会上传的模式先确认 Token 有写权限。
-			// 同一会话里相同 token+repo 只确认一次，避免每次同步都多打一次 /repos。
-			if (mode !== "pull") {
-				const permissionKey = `${token}\u0000${repository}\u0000${branch}`;
-				if (this.writePermissionKey !== permissionKey) {
-					progress.setMessage("检查 Token 写权限...");
-					await client.assertWritePermission();
-					this.writePermissionKey = permissionKey;
-				} else {
-					progress.setMessage("Token 写权限已确认");
+			// 准备阶段也把进度显示在状态栏（窗口还没准备好，用户看得到）
+			const report = (message: string, percent?: number) => {
+				onProgress?.(message, percent);
+				if (this.isPreparing) {
+					this.syncProgressText = compactSyncProgress(message);
+					this.updateStatusBar();
 				}
-			}
-
-			// 1. 获取远端文件列表：优先复用启动时静默预取的结果。
-			// 只有远端 HEAD 真的变了才会重新拉 tree；静默预取尚未结束时则共用同一个 Promise。
-			progress.setProgress(-1); // 总数未知,显示流动条
-			const remoteResult = await this.getRemoteSnapshot(client, (msg) =>
-				progress.setMessage(msg)
-			);
-			const remote = remoteResult.snapshot;
-			if (remoteResult.reused) {
-				progress.setMessage("远端列表无变化，已复用启动时的缓存");
-			}
-			if (remote.isEmpty && !remoteResult.reused) {
-				// 只有确认远端一个 commit 都没有才会走到这里：读取分支失败
-				// (限流/Token/网络)现在会直接抛错，不会再被误判成"空仓库"。
-				new Notice(
-					`ℹ️ 远端仓库 ${repository} 还是空的，本次会把本地文件作为首次上传提交（分批提交，可断点续传）。`,
-					8000
-				);
-			}
-
-			const onlyPaths = targetPath ? new Set([targetPath]) : undefined;
-
-			// 2. 读取本地文件(未变化的文件不读内容；单文件同步只扫目标文件)
-			progress.setMessage(targetPath ? `读取 ${targetPath}...` : "读取本地 Vault 文件...");
-			progress.setProgress(0);
-			const local = await this.readLocalFiles(
-				ignore,
-				remote.files,
-				(done, total) => {
-					// 节流:每 25 个文件或最后一个时才刷新 UI
-					if (done === total || done % 25 === 0) {
-						progress.setMessage(`读取本地文件 ${done}/${total}...`);
-						progress.setProgress((done / Math.max(total, 1)) * 95);
-					}
-				},
-				onlyPaths
-			);
-
-			// 3. 计算差异
-			progress.setMessage("计算差异...");
-			progress.setProgress(97);
-			// .obsidian 中未被选中同步的子项对两端同时"不可见",
-			// 否则远端存在但本地未选中的文件会被当作差异,Push 时被删除
-			const extraIgnore = (p: string) => this.isObsidianPath(p) && !this.isObsidianEntrySelected(p);
-			let diff = await computeDiff(
-				local.files,
-				local.shas,
-				remote.files,
-				ignore,
-				extraIgnore,
-				onlyPaths
-			);
-
-			// 读取失败的文件本次"不可见":既不上传/删除,也不下载/覆盖,
-			// 否则瞬时读取失败(如文件被占用)会被误判成"本地已删除"而误删远端
-			if (local.failedPaths.length > 0) {
-				const failed = new Set(local.failedPaths);
-				diff = {
-					toUpload: diff.toUpload.filter((f) => !failed.has(f.path)),
-					toDelete: diff.toDelete.filter((f) => !failed.has(f.path)),
-					toDownload: diff.toDownload.filter((f) => !failed.has(f.path)),
-					toRemove: diff.toRemove.filter((f) => !failed.has(f.path)),
-					unchanged: diff.unchanged,
-				};
-				new Notice(
-					`⚠️ ${local.failedPaths.length} 个文件读取失败，本次同步已跳过：${this.formatFailedPaths(local.failedPaths)}`,
-					8000
-				);
-			}
-
-			if (targetPath) {
-				diff = {
-					toUpload: diff.toUpload.filter((f) => f.path === targetPath),
-					toDelete: diff.toDelete.filter((f) => f.path === targetPath),
-					toDownload: diff.toDownload.filter((f) => f.path === targetPath),
-					toRemove: diff.toRemove.filter((f) => f.path === targetPath),
-					unchanged: diff.unchanged.filter((f) => f.path === targetPath),
-				};
-			}
-
-			// 4. 生成同步计划(如需要)
-			let smartPlan: SmartSyncPlan | null = null;
-			if (mode === "time") {
-				progress.setMessage("分析修改时间并生成同步计划...");
-				progress.setProgress(-1); // 需要按文件查询远端,总数即文件数但耗时未知
-				smartPlan = await this.buildTimeSyncPlan(client, local, remote, diff);
-			} else if (mode === "merge") {
-				progress.setMessage("分析冲突并生成合并计划...");
-				progress.setProgress(-1);
-				smartPlan = await this.buildMergePlan(client, local, remote, diff);
-			}
-
-			progress.close();
-
-			// 5. 弹出确认框。
-			// 每个 FileDiff 都带一个明确的 direction；确认框里用户可以逐行改，
-			// onConfirm 之后统一按 direction 重新分派，而不是继续按"模式"猜。
-			const onCompare = (path: string) => {
-				new DiffViewerModal(
-					this.app, [path], this, () => {}, false,
-					(p) => this.onCompareIdentical(p)
-				).open();
 			};
 
-			let toProcess: FileDiff[] = [];
-			let toRemove: FileDiff[] = [];
-			let unchanged = diff.unchanged.length;
-
-			if (mode === "push") {
-				toProcess = diff.toUpload.map((f): FileDiff => ({
-					...f,
-					direction: f.direction ?? "upload",
-				}));
-				// push 模式下 toDelete 是"远端有、本地无"：默认从远端删除
-				toRemove = diff.toDelete.map((f): FileDiff => ({
-					...f,
-					direction: "delete",
-				}));
-			} else if (mode === "pull") {
-				toProcess = diff.toDownload.map((f): FileDiff => ({
-					...f,
-					direction: f.direction ?? "download",
-				}));
-				// pull 模式下 toRemove 是"本地有、远端无"：默认删除本地
-				toRemove = diff.toRemove.map((f): FileDiff => ({
-					...f,
-					direction: "delete-local",
-				}));
-			} else if (mode === "time") {
-				if (!smartPlan) throw new Error("按时间同步计划生成失败");
-				toProcess = smartPlan.previewItems;
-				unchanged = smartPlan.unchanged;
-			} else {
-				if (!smartPlan) throw new Error("智能合并计划生成失败");
-				toProcess = smartPlan.previewItems;
-				unchanged = smartPlan.unchanged;
+			// 启动时的静默对比还在跑 → 直接等它，不重复拉列表、不重复扫本地
+			if (!targetPath && this.preparedBasePromise) {
+				report("等待启动时的静默对比完成...", -1);
+				await this.preparedBasePromise.catch(() => null);
 			}
 
-			if (toProcess.length === 0 && toRemove.length === 0) {
-				await this.finishWithNoChanges(targetPath, local.failedPaths);
-				return;
-			}
-
-			new ConfirmSyncModal(this.app, {
-				mode,
-				toProcess,
-				toRemove,
-				unchanged,
-				onCompare,
-				onConfirm: (selectedProcess, selectedRemove) =>
-					this.executeSelected(
-						client,
-						local.files,
-						remote,
-						selectedProcess,
-						selectedRemove
-					),
-			}).open();
-		} catch (err) {
-			progress.close();
-			console.error("GitHub Sync error:", err);
-			new Notice(`❌ 同步出错: ${getErrorMessage(err)}`);
+			return await this.buildSyncBase(client, targetPath, report);
 		} finally {
 			this.isPreparing = false;
+			this.syncProgressText = "";
 			this.updateStatusBar();
 		}
+	}
+
+	/**
+	 * 真正做一次"远端 + 本地"的对比。
+	 *
+	 * 命中缓存时直接返回上次的对比结果：
+	 * · 远端 HEAD（commit sha + tree sha）没变；
+	 * · 本地参与同步的文件指纹（mtime:size）没变；
+	 * · 忽略规则没变。
+	 * 这样用户点"同步"时只需 1 个 HEAD 请求就能拿到完整列表。
+	 */
+	private async buildSyncBase(
+		client: GitHubClient,
+		targetPath: string | undefined,
+		onProgress?: (message: string, percent?: number) => void
+	): Promise<SyncBase> {
+		const repository = (this.settings.repository || "").trim();
+		const ignore = this.buildIgnoreList();
+		const warnings: string[] = [];
+		// 记录本次使用的仓库/分支：期间若被改掉，就不缓存这份结果
+		const cacheKeyAtStart = this.remoteCacheKeyForSettings();
+
+		onProgress?.("获取 GitHub 文件列表...", -1);
+		const remoteResult = await this.getRemoteSnapshot(client, (msg) =>
+			onProgress?.(msg, -1)
+		);
+		const remote = remoteResult.snapshot;
+		if (remote.isEmpty) {
+			warnings.push(
+				`远端仓库 ${repository} 还是空的；首次同步会把本地文件作为初始提交。`
+			);
+		}
+
+		const onlyPaths = targetPath ? new Set([targetPath]) : undefined;
+
+		// 本地文件指纹（参与同步的文件集合 + 各自的 mtime:size）
+		const stamp = onlyPaths ? null : await this.computeLocalStamp(ignore);
+
+		// 复用条件全部满足 → 直接用上次的对比结果
+		if (!onlyPaths && stamp && this.preparedBase && this.preparedBaseStamp) {
+			const sameRemote =
+				(this.preparedBase.remote.commitSha ?? null) ===
+					(remote.commitSha ?? null) &&
+				(this.preparedBase.remote.treeSha ?? null) ===
+					(remote.treeSha ?? null);
+			const sameIgnore = this.preparedBaseIgnore === ignore.join("\n");
+			if (sameRemote && sameIgnore && stampsEqual(stamp, this.preparedBaseStamp)) {
+				onProgress?.("复用上次的对比结果（远端与本地都没有变化）", 100);
+				return this.preparedBase;
+			}
+		}
+
+		onProgress?.(
+			targetPath ? `读取 ${targetPath}...` : "读取本地 Vault 文件...",
+			0
+		);
+		const local = await this.readLocalFiles(
+			ignore,
+			remote.files,
+			(done, total) => {
+				if (done === total || done % 25 === 0) {
+					onProgress?.(
+						`读取本地文件 ${done}/${total}...`,
+						(done / Math.max(total, 1)) * 95
+					);
+				}
+			},
+			onlyPaths
+		);
+
+		onProgress?.("计算差异...", 97);
+		const extraIgnore = (p: string) =>
+			this.isObsidianPath(p) && !this.isObsidianEntrySelected(p);
+		let diff = await computeDiff(
+			local.files,
+			local.shas,
+			remote.files,
+			ignore,
+			extraIgnore,
+			onlyPaths
+		);
+
+		if (local.failedPaths.length > 0) {
+			const failed = new Set(local.failedPaths);
+			diff = {
+				toUpload: diff.toUpload.filter((f) => !failed.has(f.path)),
+				toDelete: diff.toDelete.filter((f) => !failed.has(f.path)),
+				toDownload: diff.toDownload.filter((f) => !failed.has(f.path)),
+				toRemove: diff.toRemove.filter((f) => !failed.has(f.path)),
+				unchanged: diff.unchanged,
+			};
+			warnings.push(
+				`${local.failedPaths.length} 个文件读取失败，本次已跳过：` +
+					this.formatFailedPaths(local.failedPaths)
+			);
+		}
+
+		if (targetPath) {
+			diff = {
+				toUpload: diff.toUpload.filter((f) => f.path === targetPath),
+				toDelete: diff.toDelete.filter((f) => f.path === targetPath),
+				toDownload: diff.toDownload.filter((f) => f.path === targetPath),
+				toRemove: diff.toRemove.filter((f) => f.path === targetPath),
+				unchanged: diff.unchanged.filter((f) => f.path === targetPath),
+			};
+		}
+
+		onProgress?.("准备完成", 100);
+		const base: SyncBase = {
+			client,
+			local,
+			remote,
+			diff,
+			targetPath,
+			warnings,
+		};
+
+		// 存下来给下一次"点同步"复用（单文件同步不缓存）
+		if (
+			!onlyPaths &&
+			stamp &&
+			this.remoteCacheKeyForSettings() === cacheKeyAtStart
+		) {
+			this.preparedBase = base;
+			this.preparedBaseStamp = stamp;
+			this.preparedBaseIgnore = ignore.join("\n");
+		}
+
+		return base;
+	}
+
+	/**
+	 * 本地"参与同步的文件"的指纹：path -> "mtime:size"。
+	 *
+	 * 用来判断上次的对比结果还能不能复用：只要有一个文件变了就得重算。
+	 */
+	private async computeLocalStamp(
+		ignore: string[]
+	): Promise<Map<string, string>> {
+		const stamp = new Map<string, string>();
+		for (const file of this.app.vault.getFiles()) {
+			if (this.shouldIgnoreLocal(file.path, ignore)) continue;
+			stamp.set(file.path, `${file.stat?.mtime ?? 0}:${file.stat?.size ?? 0}`);
+		}
+		if (this.settings.syncObsidianFolder) {
+			try {
+				const paths = await this.collectObsidianPaths(ignore);
+				await pMap(
+					paths,
+					async (p) => {
+						try {
+							const stat = await this.app.vault.adapter.stat(
+								normalizePath(p)
+							);
+							stamp.set(
+								p,
+								`${stat?.mtime ?? 0}:${stat?.size ?? 0}`
+							);
+						} catch {
+							// 读不到就当没纳入指纹
+						}
+					},
+					8
+				);
+			} catch {}
+		}
+		return stamp;
+	}
+
+	/** 在已准备的数据上生成某个模式的待确认列表（不重新扫盘/拉列表） */
+	async buildModePlan(base: SyncBase, mode: SyncMode): Promise<ModePlan> {
+		if (mode === "time") {
+			const smart = await this.buildTimeSyncPlan(
+				base.client,
+				base.local,
+				base.remote,
+				base.diff
+			);
+			return {
+				toProcess: smart.previewItems,
+				toRemove: [],
+				unchanged: smart.unchanged,
+			};
+		}
+		if (mode === "merge") {
+			const smart = await this.buildMergePlan(
+				base.client,
+				base.local,
+				base.remote,
+				base.diff
+			);
+			return {
+				toProcess: smart.previewItems,
+				toRemove: [],
+				unchanged: smart.unchanged,
+			};
+		}
+		if (mode === "push") {
+			return {
+				toProcess: base.diff.toUpload.map((f): FileDiff => ({
+					...f,
+					direction: f.direction ?? "upload",
+				})),
+				toRemove: base.diff.toDelete.map((f): FileDiff => ({
+					...f,
+					direction: "delete",
+				})),
+				unchanged: base.diff.unchanged.length,
+			};
+		}
+		return {
+			toProcess: base.diff.toDownload.map((f): FileDiff => ({
+				...f,
+				direction: f.direction ?? "download",
+			})),
+			toRemove: base.diff.toRemove.map((f): FileDiff => ({
+				...f,
+				direction: "delete-local",
+			})),
+			unchanged: base.diff.unchanged.length,
+		};
+	}
+
+	/**
+	 * 工作台点击“开始同步”后调用。
+	 * 只有真正需要写远端时才检查写权限（纯 Pull / 删本地不需要）。
+	 */
+	async executeWorkspaceSelection(
+		base: SyncBase,
+		selectedProcess: FileDiff[],
+		selectedRemove: FileDiff[],
+		reporter?: SyncProgressReporter
+	): Promise<void> {
+		const selected = [...selectedProcess, ...selectedRemove];
+		if (selected.length === 0) {
+			reporter?.error?.(new Error("未选择任何文件"));
+			return;
+		}
+
+		const needsWrite = selected.some(
+			(f) =>
+				f.direction === "upload" ||
+				f.direction === "merge" ||
+				f.direction === "delete"
+		);
+		if (needsWrite) {
+			const token = (this.settings.token || "").trim();
+			const repository = (this.settings.repository || "").trim();
+			const branch = (this.settings.branch || "main").trim() || "main";
+			const permissionKey = `${token}\u0000${repository}\u0000${branch}`;
+			if (this.writePermissionKey !== permissionKey) {
+				reporter?.message("检查 Token 写权限...");
+				await base.client.assertWritePermission();
+				this.writePermissionKey = permissionKey;
+			}
+		}
+
+		this.knownFolders.clear();
+		await this.executeSelected(
+			base.client,
+			base.local.files,
+			base.remote,
+			selectedProcess,
+			selectedRemove,
+			reporter
+		);
+	}
+
+	/**
+	 * 工作台点击“开始同步”后调用：**立即返回**，同步在后台继续跑。
+	 *
+	 * · 工作台窗口由调用方立刻关闭，用户不用等；
+	 * · 同步状态统一显示在**右上角**的卡片里（进度实时刷新，完成后变总结）；
+	 * · 右下角状态栏只在 PC 端存在，只显示 "Sync..."，不做实时进度。
+	 */
+	startBackgroundSync(
+		base: SyncBase,
+		selectedProcess: FileDiff[],
+		selectedRemove: FileDiff[],
+		mode: SyncMode
+	): void {
+		const total = selectedProcess.length + selectedRemove.length;
+		if (total === 0) {
+			new Notice("⚠️ 未选择任何文件");
+			return;
+		}
+		if (this.backgroundSyncRunning || this.isSyncing) {
+			new Notice("⚠️ 正在同步，请等待当前任务结束");
+			return;
+		}
+
+		this.rememberSyncMode(mode);
+		this.backgroundSyncRunning = true;
+		this.isSyncing = true;
+		this.syncProgressText = "准备中";
+		this.updateStatusBar();
+		this.showSyncToast(`同步中… ${total} 个文件`, true);
+
+		const reporter: SyncProgressReporter = {
+			message: (text: string) => {
+				this.syncProgressText = compactSyncProgress(text);
+				// 右下角状态栏只作"是否在同步"的提示，不做实时进度
+				if (this.statusBarEl) {
+					this.statusBarEl.title = `同步进行中：${this.syncProgressText}`;
+				}
+				this.showSyncToast(`同步中… ${this.syncProgressText}`, true);
+			},
+			done: (text: string) => {
+				this.backgroundSyncRunning = false;
+				this.isSyncing = false;
+				this.syncProgressText = "";
+				this.updateStatusBar();
+				this.showSyncSummary(text, true);
+			},
+			error: (err: unknown) => {
+				this.backgroundSyncRunning = false;
+				this.isSyncing = false;
+				this.syncProgressText = "";
+				this.updateStatusBar();
+				this.showSyncSummary(`同步失败：${getErrorMessage(err)}`, false);
+			},
+		};
+
+		void this.executeWorkspaceSelection(
+			base,
+			selectedProcess,
+			selectedRemove,
+			reporter
+		)
+			.catch((err) => reporter.error?.(err))
+			.finally(() => {
+				this.backgroundSyncRunning = false;
+				this.isSyncing = false;
+				this.syncProgressText = "";
+				this.updateStatusBar();
+			});
+	}
+
+	/**
+	 * 同步结束后的总结：右上角卡片切换成最终结果。
+	 */
+	private showSyncSummary(text: string, ok: boolean): void {
+		try {
+			const oneLine = text
+				.replace(/^✅\s*/, "")
+				.replace(/[，,]\s*/g, " · ")
+				.trim();
+			this.showSyncToast(oneLine, false, ok);
+		} catch (err) {
+			console.warn("显示同步总结失败:", err);
+			new Notice(text);
+		}
+	}
+
+	/**
+	 * 右上角同步卡片：**单行**，简单直接。
+	 *
+	 * · 进行中：带小转圈，显示当前进度；长时间没动静会自动收起；
+	 * · 完成后：变成一行总结，6 秒后自动收起。
+	 */
+	private showSyncToast(text: string, live: boolean, ok = true): void {
+		try {
+			const body = document.body;
+			if (!body) return;
+			if (this.toastTimer) {
+				window.clearTimeout(this.toastTimer);
+				this.toastTimer = null;
+			}
+
+			let toast = this.syncToast;
+			if (!toast || toast.parentElement == null) {
+				const created = body.createDiv({ cls: "egs-toast" });
+				this.syncToast = created;
+				window.requestAnimationFrame(() =>
+					created.addClass("is-visible")
+				);
+				toast = created;
+			}
+
+			toast.empty();
+			toast.toggleClass("is-error", !ok);
+			toast.toggleClass("is-live", live);
+
+			const row = toast.createDiv("egs-toast-row");
+			if (live) {
+				row.createDiv({
+					cls: "egs-toast-spinner",
+					attr: { "aria-hidden": "true" },
+				});
+			} else {
+				row.createSpan({ text: ok ? "✅" : "⚠️", cls: "egs-toast-icon" });
+			}
+			row.createSpan({ text, cls: "egs-toast-text" });
+
+			// 进行中：长时间没有新进度就自动收起（下次有进度会再冒出来）
+			this.toastTimer = window.setTimeout(
+				() => this.hideToast(toast),
+				live ? 15000 : 6000
+			);
+		} catch (err) {
+			console.warn("显示右上角同步卡片失败:", err);
+		}
+	}
+
+	private hideToast(toast: HTMLElement): void {
+		if (!toast || toast.parentElement == null) return;
+		if (this.toastTimer) {
+			window.clearTimeout(this.toastTimer);
+			this.toastTimer = null;
+		}
+		if (this.syncToast === toast) this.syncToast = null;
+		toast.removeClass("is-visible");
+		window.setTimeout(() => {
+			try {
+				toast.remove();
+			} catch {}
+		}, 400);
+	}
+
+	/** 现在是否正在同步（工作台的对比预取要避让） */
+	get isSyncingNow(): boolean {
+		return this.isSyncing || this.backgroundSyncRunning;
+	}
+
+	/** 此设备上次选择的同步模式 */
+	getLastSyncMode(): SyncMode {
+		const mode = this.settings.lastSyncMode;
+		return mode === "push" || mode === "pull" || mode === "time" || mode === "merge"
+			? mode
+			: "time";
+	}
+
+	rememberSyncMode(mode: SyncMode): void {
+		if (this.settings.lastSyncMode === mode) return;
+		this.settings.lastSyncMode = mode;
+		void this.saveSettings().catch((err) =>
+			console.warn("保存上次同步模式失败:", err)
+		);
+	}
+
+	/** 工作台确认“全量 diff 为空”时，把状态栏结算为已同步 */
+	async markAllSynced(): Promise<void> {
+		await this.clearDirtyState();
 	}
 
 	// ──────────────────────────────────────────────
 	// 回滚
 	// ──────────────────────────────────────────────
 
-	private async openRollback() {
+	async openRollback(): Promise<void> {
 		if (!this.checkConfig()) return;
 		try {
 			const snapshots = await this.rollbackManager.getSnapshots();
@@ -1336,8 +1728,10 @@ export default class GitHubSyncPlugin extends Plugin {
 		const remoteMap = new Map(remote.files.map((f) => [f.path, f] as const));
 		const headSha = remote.commitSha;
 		const cache = await this.loadRemoteMtimeCache();
-		const sameHead = (cache?.headCommitSha ?? null) === (headSha ?? null);
-		const entries = sameHead ? cache!.entries : {};
+		// 按"文件的 blob sha"命中，而不是要求 HEAD 完全一致：
+		// HEAD 变了通常只是某个文件被改，其它文件的时间没变，
+		// 这样就只用重新查真正变化的那几个文件（而不是整批重查）。
+		const entries = cache?.entries ?? {};
 		const missing: string[] = [];
 
 		for (const path of paths) {
@@ -1356,9 +1750,7 @@ export default class GitHubSyncPlugin extends Plugin {
 			missing,
 			remote.commitSha ?? undefined
 		);
-		const nextEntries: Record<string, RemoteMtimeEntry> = sameHead
-			? { ...entries }
-			: {};
+		const nextEntries: Record<string, RemoteMtimeEntry> = { ...entries };
 		for (const [path, mtime] of fetched) {
 			const remoteSha = remoteMap.get(path)?.sha;
 			if (remoteSha) nextEntries[path] = { sha: remoteSha, mtime };
@@ -1414,7 +1806,8 @@ export default class GitHubSyncPlugin extends Plugin {
 		localFiles: Map<string, ArrayBuffer | null>,
 		remote: RemoteSnapshot,
 		selectedProcess: FileDiff[],
-		selectedRemove: FileDiff[]
+		selectedRemove: FileDiff[],
+		reporter?: SyncProgressReporter
 	) {
 		// 同一路径理论上只会在一个分组里；用 Map 再兜底一次，避免 UI 改向后重复
 		const byPath = new Map<string, FileDiff>();
@@ -1435,7 +1828,8 @@ export default class GitHubSyncPlugin extends Plugin {
 			remoteDeletes.length === 0 &&
 			localDeletes.length === 0
 		) {
-			new Notice("⚠️ 没有可执行的动作");
+			if (reporter) reporter.error?.(new Error("没有可执行的动作"));
+			else new Notice("⚠️ 没有可执行的动作");
 			return;
 		}
 
@@ -1449,7 +1843,8 @@ export default class GitHubSyncPlugin extends Plugin {
 				downloads,
 				merges,
 				remoteDeletes,
-				localDeletes
+				localDeletes,
+				reporter
 			);
 		} else {
 			await this.executeSmartSync(
@@ -1460,7 +1855,8 @@ export default class GitHubSyncPlugin extends Plugin {
 				uploads,
 				downloads,
 				remoteDeletes,
-				localDeletes
+				localDeletes,
+				reporter
 			);
 		}
 	}
@@ -1477,18 +1873,25 @@ export default class GitHubSyncPlugin extends Plugin {
 		uploads: FileDiff[],
 		downloads: FileDiff[],
 		toDeleteFromRemote: FileDiff[] = [],
-		toDeleteLocal: FileDiff[] = []
+		toDeleteLocal: FileDiff[] = [],
+		reporter?: SyncProgressReporter
 	) {
 		this.isSyncing = true;
 		this.updateStatusBar();
 		downloads.forEach(f => this.recentlySyncedPaths.add(f.path));
 
-		const startNotice = new Notice(
-			`🔀 开始同步，上传 ${uploads.length}，下载 ${downloads.length}` +
-				`${toDeleteFromRemote.length ? `，删除远端 ${toDeleteFromRemote.length}` : ""}` +
-				`${toDeleteLocal.length ? `，删除本地 ${toDeleteLocal.length}` : ""}...`,
-			0
-		);
+		const startNotice = reporter
+			? null
+			: new Notice(
+					`🔀 开始同步，上传 ${uploads.length}，下载 ${downloads.length}` +
+						`${toDeleteFromRemote.length ? `，删除远端 ${toDeleteFromRemote.length}` : ""}` +
+						`${toDeleteLocal.length ? `，删除本地 ${toDeleteLocal.length}` : ""}...`,
+					0
+			  );
+		const report = (text: string) => {
+			if (reporter) reporter.message(text);
+			else if (startNotice) this.setNoticeText(startNotice, text);
+		};
 		try {
 			// 快照 I/O 与网络 I/O 并行
 			const preSyncPaths = [
@@ -1519,7 +1922,7 @@ export default class GitHubSyncPlugin extends Plugin {
 					currentCommitSha,
 					currentTreeSha,
 					(done, total, path) =>
-						this.setNoticeText(startNotice, `⬆️ 上传中 ${done}/${total}：${path}`)
+						report(`⬆️ 上传中 ${done}/${total}：${path}`)
 				  ).then(r => ({ commitSha: r.newCommitSha, treeSha: r.newTreeSha }))
 				: Promise.resolve(null);
 
@@ -1527,7 +1930,7 @@ export default class GitHubSyncPlugin extends Plugin {
 				? client.downloadFiles(
 					downloads.map((f) => ({ path: f.path, sha: f.remoteSha })),
 					(done, total, path) =>
-						this.setNoticeText(startNotice, `⬇️ 下载中 ${done}/${total}：${path}`)
+						report(`⬇️ 下载中 ${done}/${total}：${path}`)
 				  )
 				: Promise.resolve(new Map<string, ArrayBuffer>());
 
@@ -1565,7 +1968,7 @@ export default class GitHubSyncPlugin extends Plugin {
 				await this.deleteLocalFile(f.path);
 			}
 
-			startNotice.hide();
+			startNotice?.hide();
 			const failedUploads = uploads.filter(f => !localFiles.get(f.path)).map(f => f.path);
 			const failedDownloads = downloads.filter(f => !downloaded.get(f.path)).map(f => f.path);
 			if (failedUploads.length > 0) {
@@ -1580,11 +1983,10 @@ export default class GitHubSyncPlugin extends Plugin {
 					8000
 				);
 			}
-			new Notice(
+			const doneMessage =
 				`✅ 同步完成：上传 ${uploadedPaths.length}/${uploads.length}，` +
-					`下载 ${writtenPaths.length}/${downloads.length}，` +
-					`删除远端 ${toDeleteFromRemote.length}，删除本地 ${toDeleteLocal.length}`
-			);
+				`下载 ${writtenPaths.length}/${downloads.length}，` +
+				`删除远端 ${toDeleteFromRemote.length}，删除本地 ${toDeleteLocal.length}`;
 			if (uploadedPaths.length > 0 || toDeleteFromRemote.length > 0) {
 				this.markRemoteChanged();
 			}
@@ -1596,9 +1998,12 @@ export default class GitHubSyncPlugin extends Plugin {
 					...toDeleteLocal.map((f) => f.path),
 				]
 			);
+			if (reporter) reporter.done?.(doneMessage);
+			else new Notice(doneMessage);
 		} catch (err) {
-			startNotice.hide();
+			startNotice?.hide();
 			console.error("Smart sync error:", err);
+			reporter?.error?.(err);
 			await this.notifyPartialFailure(err, "智能同步");
 		} finally {
 			this.isSyncing = false;
@@ -1622,19 +2027,26 @@ export default class GitHubSyncPlugin extends Plugin {
 		downloads: FileDiff[],
 		merges: FileDiff[],
 		toDeleteFromRemote: FileDiff[] = [],
-		toDeleteLocal: FileDiff[] = []
+		toDeleteLocal: FileDiff[] = [],
+		reporter?: SyncProgressReporter
 	) {
 		this.isSyncing = true;
 		this.updateStatusBar();
 		downloads.forEach(f => this.recentlySyncedPaths.add(f.path));
 		merges.forEach(f => this.recentlySyncedPaths.add(f.path));
 
-		const startNotice = new Notice(
-			`🔀 开始合并同步，上传 ${uploads.length}，下载 ${downloads.length}，合并 ${merges.length}` +
-				`${toDeleteFromRemote.length ? `，删除远端 ${toDeleteFromRemote.length}` : ""}` +
-				`${toDeleteLocal.length ? `，删除本地 ${toDeleteLocal.length}` : ""}...`,
-			0
-		);
+		const startNotice = reporter
+			? null
+			: new Notice(
+					`🔀 开始合并同步，上传 ${uploads.length}，下载 ${downloads.length}，合并 ${merges.length}` +
+						`${toDeleteFromRemote.length ? `，删除远端 ${toDeleteFromRemote.length}` : ""}` +
+						`${toDeleteLocal.length ? `，删除本地 ${toDeleteLocal.length}` : ""}...`,
+					0
+			  );
+		const report = (text: string) => {
+			if (reporter) reporter.message(text);
+			else if (startNotice) this.setNoticeText(startNotice, text);
+		};
 		try {
 			// Phase 1：快照 I/O + 所有网络请求并行
 			const preSyncPaths = [
@@ -1656,7 +2068,7 @@ export default class GitHubSyncPlugin extends Plugin {
 				merges.map(async (item) => {
 					const rc = await client.downloadFile(item.path, item.remoteSha).catch(() => null);
 					mergeDone++;
-					this.setNoticeText(startNotice, `🔀 拉取冲突文件 ${mergeDone}/${merges.length}：${item.path}`);
+					report(`🔀 拉取冲突文件 ${mergeDone}/${merges.length}：${item.path}`);
 					return { item, remoteContent: rc };
 				})
 			);
@@ -1665,7 +2077,7 @@ export default class GitHubSyncPlugin extends Plugin {
 				? client.downloadFiles(
 					downloads.map((f) => ({ path: f.path, sha: f.remoteSha })),
 					(done, total, path) =>
-						this.setNoticeText(startNotice, `⬇️ 下载中 ${done}/${total}：${path}`)
+						report(`⬇️ 下载中 ${done}/${total}：${path}`)
 				  )
 				: Promise.resolve(new Map<string, ArrayBuffer>());
 
@@ -1708,7 +2120,7 @@ export default class GitHubSyncPlugin extends Plugin {
 					uploadResult = await client.batchUpload(
 						filesToUpload, message, currentCommitSha, currentTreeSha,
 						(done, total, path) =>
-							this.setNoticeText(startNotice, `⬆️ 上传中 ${done}/${total}：${path}`)
+							report(`⬆️ 上传中 ${done}/${total}：${path}`)
 					);
 					uploadedPaths = filesToUpload.map((f) => f.path);
 				}
@@ -1719,8 +2131,7 @@ export default class GitHubSyncPlugin extends Plugin {
 				const delCommitSha = uploadResult?.newCommitSha ?? currentCommitSha;
 				const delTreeSha = uploadResult?.newTreeSha ?? currentTreeSha;
 				if (delCommitSha && delTreeSha) {
-					this.setNoticeText(
-						startNotice,
+					report(
 						`🗑️ 正在从远端删除 ${toDeleteFromRemote.length} 个文件...`
 					);
 					await client.batchDelete(
@@ -1743,7 +2154,7 @@ export default class GitHubSyncPlugin extends Plugin {
 				await this.deleteLocalFile(f.path);
 			}
 
-			startNotice.hide();
+			startNotice?.hide();
 			const failedMerges = merges.filter(f => !mergedSet.has(f.path)).map(f => f.path);
 			if (failedMerges.length > 0) {
 				new Notice(
@@ -1758,11 +2169,10 @@ export default class GitHubSyncPlugin extends Plugin {
 					8000
 				);
 			}
-			new Notice(
+			const doneMessage =
 				`✅ 合并同步完成：上传 ${uploadedPaths.length}/${uploads.length + merges.length}，` +
-					`下载 ${writtenPaths.length}/${downloads.length}，合并 ${mergedPaths.length}/${merges.length}，` +
-					`删除远端 ${toDeleteFromRemote.length}，删除本地 ${toDeleteLocal.length}`
-			);
+				`下载 ${writtenPaths.length}/${downloads.length}，合并 ${mergedPaths.length}/${merges.length}，` +
+				`删除远端 ${toDeleteFromRemote.length}，删除本地 ${toDeleteLocal.length}`;
 			if (uploadedPaths.length > 0 || toDeleteFromRemote.length > 0) {
 				this.markRemoteChanged();
 			}
@@ -1774,9 +2184,12 @@ export default class GitHubSyncPlugin extends Plugin {
 					...toDeleteLocal.map((f) => f.path),
 				]
 			);
+			if (reporter) reporter.done?.(doneMessage);
+			else new Notice(doneMessage);
 		} catch (err) {
-			startNotice.hide();
+			startNotice?.hide();
 			console.error("Merge sync error:", err);
+			reporter?.error?.(err);
 			await this.notifyPartialFailure(err, "合并同步");
 		} finally {
 			this.isSyncing = false;
@@ -1855,7 +2268,7 @@ export default class GitHubSyncPlugin extends Plugin {
 					this.isObsidianPath(path)
 				);
 			} else {
-				obsidianPaths = await this.listAdapterPaths(".obsidian");
+				obsidianPaths = await this.collectObsidianPaths(ignore);
 			}
 			obsidianPaths = obsidianPaths
 				.filter((path) => this.isObsidianEntrySelected(path))
@@ -2025,6 +2438,38 @@ export default class GitHubSyncPlugin extends Plugin {
 		if (!rest) return false;
 		if (sel.includes(rest)) return true;
 		return sel.some((s) => rest.startsWith(s + "/"));
+	}
+
+	/**
+	 * 收集"参与同步的 .obsidian 文件"路径。
+	 *
+	 * 用户在设置里选了具体子项时，只走选中的那些路径（不用遍历整个 .obsidian）；
+	 * 没选（=全部）时才递归遍历整个目录。
+	 */
+	private async collectObsidianPaths(ignore: string[]): Promise<string[]> {
+		const sel = (this.settings.obsidianSyncSelection || []).filter(Boolean);
+		let candidates: string[] = [];
+		if (sel.length === 0) {
+			candidates = await this.listAdapterPaths(".obsidian");
+		} else {
+			for (const entry of sel) {
+				const full = normalizePath(".obsidian/" + entry);
+				try {
+					const stat = await this.app.vault.adapter.stat(full);
+					if (!stat) continue;
+					if (stat.type === "folder") {
+						candidates.push(...(await this.listAdapterPaths(full)));
+					} else {
+						candidates.push(full);
+					}
+				} catch {
+					// 选中的条目可能已经被删除
+				}
+			}
+		}
+		return candidates
+			.filter((path) => this.isObsidianEntrySelected(path))
+			.filter((path) => !this.shouldIgnoreLocal(path, ignore));
 	}
 
 	/** 递归列出目录下所有文件路径（含 .obsidian）；子目录并行扫描 */

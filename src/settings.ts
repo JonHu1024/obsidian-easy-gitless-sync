@@ -8,6 +8,7 @@ import {
 import type GitHubSyncPlugin from "./main";
 import { ObsidianSyncPickerModal } from "./modals";
 import { GitHubClient } from "./github";
+import type { SyncMode } from "./types";
 
 export interface GitHubSyncSettings {
     token: string;
@@ -34,6 +35,8 @@ export interface GitHubSyncSettings {
 	timeSyncOneSided: "keep-both" | "local-mirror";
 	// 启动后 / 每次同步完成后静默预取 GitHub 文件列表
 	prefetchRemoteOnStartup: boolean;
+	// 此设备上次选择的同步模式（data.json 不同步，因此天然按设备记忆）
+	lastSyncMode: SyncMode;
 }
 
 export const DEFAULT_SETTINGS: GitHubSyncSettings = {
@@ -51,6 +54,7 @@ export const DEFAULT_SETTINGS: GitHubSyncSettings = {
 	uploadConcurrency: 8,
 	timeSyncOneSided: "keep-both",
 	prefetchRemoteOnStartup: true,
+	lastSyncMode: "time",
 };
 
 export class GitHubSyncSettingTab extends PluginSettingTab {
